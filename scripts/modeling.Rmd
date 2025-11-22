@@ -1,0 +1,2727 @@
+---
+title: "Modeling"
+author: "Gene Estrada"
+date: "2024-02-14"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+	echo = FALSE,
+	message = FALSE,
+	warning = FALSE
+)
+
+setwd("~/leech_indicators")
+
+library(tidyverse)
+library(glmmTMB)
+library(ggmap)
+library(sf)
+library(ggstatsplot)
+library(sjPlot)
+library(car)
+library(PerformanceAnalytics)
+library(performance)
+library(gridExtra)
+library(MuMIn)
+library(cowplot)
+library(Hmisc)
+
+#read in pruned mammal observation table
+pruned <- readRDS("data/pruned.rds")
+
+#ordering forest types and forest type partitions
+pruned$habitat <- factor(pruned$habitat, levels = c("Peat Swamp", "Freshwater Swamp", "Alluvial Bench", 
+                                          "Lowland Sandstone", "Lowland Granite", "Upland Granite", "Montane"))
+
+pruned$partition <- factor(pruned$partition, levels = c("PS1", "FS1", "AB1", "AB2", "LS1", "LS2", 
+                                                        "LG1", "LG2", "UG1", "UG2", "MO1", "MO2"))
+
+#create modified partition column, combining UG and MO partitions
+pruned <- pruned %>%
+  mutate(partition.mod = case_when(partition == "UG1" ~ "UGM1",
+                                   partition == "MO1" ~ "UGM1",
+                                   partition == "UG2" ~ "UGM2",
+                                   partition == "MO2" ~ "UGM2",
+                                   TRUE ~ partition))
+
+pruned$partition.mod <- factor(pruned$partition.mod, levels = c("PS1", "FS1", "AB1", "AB2", "LS1", "LS2", 
+                                                        "LG1", "LG2", "UGM1", "UGM2"))
+
+#add pheno data by modified partition
+pheno_by_pt_mod <- read.csv(file = "data/pheno.by.ft.raw.csv", header = TRUE)
+
+#changing naming convention
+pheno_by_pt_mod <- pheno_by_pt_mod %>%
+  mutate(partition.mod = case_when(partishun == "PS.I" ~ "PS1",
+                                   partishun == "FS.I" ~ "FS1",
+                                   partishun == "AB.I" ~ "AB1",
+                                   partishun == "AB.II" ~ "AB2",
+                                   partishun == "LS.I" ~ "LS1",
+                                   partishun == "LS.II" ~ "LS2",
+                                   partishun == "LG.I" ~ "LG1",
+                                   partishun == "LG.II" ~ "LG2",
+                                   partishun == "UGM.I" ~ "UGM1",
+                                   partishun == "UGM.II" ~ "UGM2",
+                                   TRUE ~ partishun))
+
+#add new pheno data to pruned obs table
+pruned <- left_join(pruned, pheno_by_pt_mod[,c("partition.mod", "z_pheno_mod", "samplingperiod")], 
+          by = c("partition.mod", "samplingperiod"))
+
+#read in mammal observation by location summary table
+mammals_by_loc <- read.csv(file = "data/mammals_by_loc.csv", header = TRUE)
+
+#read in table describing camera trap nights by ct location, adding to mammal summary table
+act_days <- read.csv(file = "data/act_days_by_location.csv", header = TRUE)
+mammals_by_loc <- left_join(mammals_by_loc, act_days[,-1], by = "locationID")
+
+#read in mammal trait data
+mammal_traits <- read.csv(file = "data/mammal_list_ct_trait_202403.csv", header = TRUE)
+
+pruned <- left_join(pruned, 
+                    mammal_traits[,c("Species", "ActivityCycle", "AdultBodyMass_g", 
+                                     "Terrestriality", "TrophicLevel", "Diet")],
+                  by = "Species")
+
+#aggregating observations by sampling period
+pruned_aggregated <- pruned %>%
+  group_by(samplingperiod, Species, locationID) %>%
+  summarise(Number.of.Animals = sum(num_observed), .groups = "drop")
+
+pruned_aggregated <- pruned %>%
+  distinct(samplingperiod, locationID, .keep_all = TRUE) %>%
+  select(location, locationID, samplingperiod, habitat, partition.mod, on_off_trail, 
+         altitude, z_rain, z_min, z_max, z_pheno_mod, z_elev, z_picta_part, 
+         z_zeylanica_part, active.days) %>%
+  left_join(pruned_aggregated, ., by = c("samplingperiod", "locationID"))
+
+pruned_aggregated <- left_join(pruned_aggregated, 
+                    mammal_traits[,c("Species", "ActivityCycle", "AdultBodyMass_g", "Family",
+                                     "Terrestriality", "TrophicLevel", "Diet")],
+                  by = "Species")
+
+#removing observations from kerangas and rangkong forest types
+pruned_aggregated <- pruned_aggregated[!is.na(pruned_aggregated$habitat),]
+
+#removing arboreal mammal observations (keeping unid rats and M.nemestrina)
+pruned_aggregated$Terrestriality[pruned_aggregated$Species == "Unid Rat"] <- 1
+pruned_aggregated$Terrestriality[pruned_aggregated$Species == "Macaca nemestrina"] <- 1
+
+pruned_aggregated <- pruned_aggregated %>%
+  filter(Terrestriality == 1)
+
+pruned_aggregated$on.off.trail <- pruned_aggregated$on_off_trail
+```
+
+
+Creating mammal observation table by family
+```{r}
+mammals_by_fam <- pruned %>%
+  group_by(Family, Species) %>%
+  summarise(count = sum(num_observed)) %>%
+  arrange(Family, desc(count)) %>%
+  print(n = Inf)
+```
+
+
+Spearman correlation between quantitative predictors
+```{r eval=FALSE, include=FALSE}
+chart.Correlation(pruned_aggregated[,c("z_rain","z_max","z_min","z_pheno_mod","z_elev",
+                            "z_picta_part", "z_zeylanica_part")],
+                  histogram = TRUE, pch = 16, method = "spearman")
+```
+
+
+## Mammal traits
+
+Active period
+1 = nocturnal, 2 = nocturnal or diurnal/crepuscular, 3 = diurnal
+```{r}
+table(mammal_traits$ActivityCycle)
+
+#missing data for observations without species ID (e.g., Unid squirrel)
+table(is.na(mammal_traits$ActivityCycle))
+mammal_traits[is.na(mammal_traits$ActivityCycle),]
+```
+
+Body mass
+```{r}
+hist(mammal_traits$AdultBodyMass_g, breaks = 30)
+hist(mammal_traits$AdultBodyMass_g[mammal_traits$AdultBodyMass_g < 20000], breaks = 30)
+summary(mammal_traits$AdultBodyMass_g)
+
+#some missing data here - mostly Unid species or animals not identified to species level
+table(is.na(mammal_traits$AdultBodyMass_g))
+mammal_traits[is.na(mammal_traits$AdultBodyMass_g),]
+```
+
+Terrestriality
+1 = terrestrial, 2 = arboreal
+```{r}
+table(mammal_traits$Terrestriality)
+
+#missing values
+table(is.na(mammal_traits$Terrestriality))
+mammal_traits[is.na(mammal_traits$AdultBodyMass_g),]
+```
+
+Trophic Level
+1 = herbivore, 2 = omnivore, 3 = carnivore
+```{r}
+table(mammal_traits$TrophicLevel)
+
+#missing values
+table(is.na(mammal_traits$TrophicLevel))
+mammal_traits[is.na(mammal_traits$TrophicLevel),]
+```
+
+## Modeling all mammals
+
+Correlation between predictors in full model
+```{r}
+df <- pruned_aggregated[, c("z_picta_part", "z_zeylanica_part", 
+                            "z_rain", "z_min", "z_max", "z_pheno_mod")]
+
+colnames(df) <- c("tiger leech", "brown leech", "rainfall", 
+                  "min. temperature", "max. temperature", "fruit availability")
+
+#correlation plot
+corr_results <- rcorr(as.matrix(df), type = "spearman")
+
+cor_matrix <- corr_results$r
+p_matrix <- corr_results$P 
+
+#save plot
+#jpeg("SpearCorrPlot.jpg", width = 5, height = 6, units = "in", res = 350)
+
+#corrplot(cor_matrix,
+ #        method = "color",          
+  #       type = "upper",            
+   #      tl.col = "black",          
+    #     tl.srt = 45,               
+     #    tl.cex = 0.8,              
+      #   cl.pos = "r",              
+       #  addCoef.col = TRUE,
+        # number.cex = 1,
+         #number.font = 1,
+         #diag = FALSE)
+
+#dev.off()
+```
+
+
+Zero-inflated model using only leech counts, by partition
+```{r}
+#model
+mod1.1 <- glmmTMB(Number.of.Animals ~
+         z_picta_part +              #rate of H. picta by partition
+         z_zeylanica_part +          #rate of H. zeylanica by partition
+         samplingperiod +            #30-day sampling period ID
+         on.off.trail +              #CT placement on- or off-trail
+         (1|locationID) +            #controlling for CT locations
+         (1|Species),                #controlling for species 
+         offset = log(active.days),  #controlling for uneven CT survey effort 
+         data = pruned_aggregated,
+         family = nbinom2,           #negative binomial
+         ziformula = ~1)             #intercept-only zero-inflated portion
+
+#summary
+summary(mod1.1)
+
+#check Variance Inflation Factor values (VIF>5 indicates multicollinearity issues)
+check_collinearity(mod1.1)
+
+#coefficient plot
+ggcoefstats(mod1.1, exclude.intercept = TRUE, stats.labels = FALSE, ylab = "") +
+  theme_classic() +
+  scale_y_discrete(labels = c("tiger leeches", "brown leeches", "sampling period", "CT on/off trail")) +
+  labs(title = "All Mammals - Leech Counts by partition")
+
+#marginal effects plots for leech species predictors
+mp1 <- plot_model(mod1.1, type = "pred", terms = "z_picta_part") 
+mp2 <- plot_model(mod1.1, type = "pred", terms = "z_zeylanica_part")
+grid.arrange(mp1, mp2, nrow = 1)
+```
+
+Model with leeches and ecological predictors
+```{r}
+#model using {glmmTMB}
+mod2 <- glmmTMB(Number.of.Animals ~
+         z_picta_part +
+         z_zeylanica_part +
+         samplingperiod +
+         on.off.trail +
+         z_rain +             #rainfall     
+         z_max +              #max temp     
+         z_min +              #min temp     
+         z_pheno_mod +        #ripe fruit abundance     
+         (1|locationID) +
+         (1|Species),
+         offset = log(active.days),
+         data = pruned_aggregated,
+         family = nbinom2,
+         ziformula = ~1)
+
+summary(mod2)
+check_collinearity(mod2)
+
+#plot
+broom.mixed::tidy(mod2, conf.int = TRUE) %>%
+  filter(effect == "fixed", !term %in% c("samplingperiod", "on.off.trailON", "(Intercept)")) %>%
+  mutate(term = fct_reorder(term, estimate, .desc = FALSE)) %>%
+  ggplot(aes(x = term, y = estimate)) +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0, color = "gray60") +
+  geom_errorbar(aes(ymin = conf.low + (conf.high - conf.low) * 0.25, 
+                    ymax = conf.high - (conf.high - conf.low) * 0.25), 
+                width = 0, color = "black", size = 1) +
+  geom_point(size = 2, color = "black") +
+  coord_flip() +  
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+  scale_x_discrete(labels = c("z_picta_part" = "tiger leech",
+                              "z_zeylanica_part" = "brown leech",
+                              "z_rain" = "rainfall",
+                              "z_max" = "max. temp",
+                              "z_min" = "min. temp",
+                              "z_pheno_mod" = "fruit")) +
+  theme_classic() +
+  labs(y = "estimate") +
+  theme(axis.title.y = element_blank())
+
+
+#marginal effects plots for leech species predictors
+mp1 <- plot_model(mod2, type = "pred", terms = "z_picta_part") +
+  coord_cartesian(ylim = c(0, 0.016)) +
+  theme_classic() +
+  labs(x = "tiger leech rate (z)", y = "mammal count",  title = "")
+mp2 <- plot_model(mod2, type = "pred", terms = "z_zeylanica_part") +
+  coord_cartesian(ylim = c(0, 0.016)) +
+  theme_classic() +
+  theme(axis.title.y = element_blank(), axis.text.y = element_blank()) +
+  labs(x = "brown leech rate (z)", y = "", title = "")
+
+plot_grid(mp1 + theme(legend.position = "none"), mp2, 
+          labels = c("A", "B"),
+          label_size = 14, label_fontface = "bold",
+          rel_widths = c(0.52, 0.48))
+
+#ggsave("AllMammals_MEPlot.jpg", width = 6.5, height = 3.5, dpi = 350)
+```
+
+Model with ecological predictors only
+```{r}
+mod3 <- glmmTMB(Number.of.Animals ~
+         samplingperiod +
+         on.off.trail +
+         z_rain +                  
+         z_max +                   
+         z_min +      
+         z_pheno_mod +   
+         (1|locationID) +
+         (1|Species),
+         offset = log(active.days),
+         data = pruned_aggregated,
+         family = nbinom2,
+         ziformula = ~1)
+
+summary(mod3)
+
+ggcoefstats(mod3, exclude.intercept = TRUE, stats.labels = FALSE, ylab = "") +
+  theme_classic() +
+  scale_y_discrete(labels = c("sampling period", "on/off trail", "rainfall",
+                              "max temp", "min temp", "fruit")) +
+  labs(title = "All Mammals - All Predictors Except Leeches")
+```
+
+Full model with interactions between leeches and rain
+```{r}
+mod4 <- glmmTMB(Number.of.Animals ~
+         z_picta_part * z_rain +
+         z_zeylanica_part * z_rain +
+         samplingperiod +
+         on.off.trail +
+         z_max +                   
+         z_min +                   
+         z_pheno_mod +             
+         (1|locationID) +
+         (1|Species),
+         offset = log(active.days),
+         data = pruned_aggregated,
+         family = nbinom2,
+         ziformula = ~1)
+
+summary(mod4)
+
+#coef plot
+broom.mixed::tidy(mod4, conf.int = TRUE) %>%
+  filter(effect == "fixed", !term %in% c("samplingperiod", "on.off.trailON", "(Intercept)")) %>%
+  mutate(term = fct_reorder(term, estimate, .desc = FALSE)) %>%
+  ggplot(aes(x = term, y = estimate)) +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0, color = "gray20") +
+  geom_errorbar(aes(ymin = conf.low + (conf.high - conf.low) * 0.25, 
+                    ymax = conf.high - (conf.high - conf.low) * 0.25), 
+                width = 0, color = "black", size = 1.1) +
+  geom_point(size = 2, color = "black") +
+  coord_flip() +  
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey60") +
+  scale_x_discrete(labels = c("z_picta_part" = "tiger leech",
+                              "z_zeylanica_part" = "brown leech",
+                              "z_rain" = "rainfall",
+                              "z_max" = "max. temperature",
+                              "z_min" = "min. temperature",
+                              "z_pheno_mod" = "fruit abundance",
+                              "z_picta_part:z_rain" = "tiger leech X rain",
+                              "z_rain:z_zeylanica_part" = "brown leech X rain")) +
+  theme_classic() +
+  labs(y = "coefficient estimate", title = "all-mammals model") +
+  theme(axis.title.y = element_blank())
+
+#ggsave(filename = "AllMammalsInt_coefplot.jpg", device = "jpeg", width = 5, height = 3.5, dpi = 300)
+```
+
+interaction plot
+```{r}
+p1 <- plot_model(mod4, type = "pred", terms = c("z_picta_part", "z_rain [minmax]")) +
+  theme_classic() +
+  labs(x = "tiger leech rate (z)", y = "mammal count", 
+       title = "", color = "rainfall (z)") +
+  theme(legend.position = "none") +
+  coord_cartesian(ylim = c(0, 0.02))
+
+p2 <- plot_model(mod4, type = "pred", terms = c("z_zeylanica_part", "z_rain [minmax]")) +
+  theme_classic() +
+  labs(x = "brown leech rate (z)", y = "", 
+       title = "", color = "rainfall (z)") +
+  theme(legend.position = "right", axis.text.y  = element_blank()) +
+  coord_cartesian(ylim = c(0, 0.02))
+
+plot_grid(p1 + theme(legend.position = "none"), p2, 
+          labels = c("A", "B"),
+          label_size = 14, label_fontface = "bold",
+          rel_widths = c(0.45, 0.55))
+
+#ggsave("AllMammals_IntPlot.jpg", width = 7.5, height = 3.5, dpi = 350)
+```
+
+model selection with AIC
+```{r}
+AIC(mod1.1, mod2, mod3, mod4)
+```
+
+
+## Modeling single mammal species
+
+Table showing number of observations by species over study period.
+```{r}
+mammals_by_obs <- as.data.frame(table(pruned$Species)) %>% arrange(desc(Freq)) %>% print()
+```
+
+
+### Rats (Family Muridae)
+
+```{r}
+hist(pruned$num_observed[pruned$Species == "Unid Rat"])
+table(pruned$num_observed[pruned$Species == "Unid Rat"]) # >99% of obs are solitary rats
+```
+
+model - leech counts only 
+```{r}
+rats_m1 <- glmmTMB(Number.of.Animals ~
+         z_picta_part +
+         z_zeylanica_part +
+         samplingperiod +   
+         on.off.trail +   
+         (1|partition.mod),
+         offset = log(active.days),
+         data = pruned_aggregated[pruned_aggregated$Species == "Unid Rat",],
+         family = nbinom2,
+         ziformula = ~1)
+
+summary(rats_m1)
+
+ggcoefstats(rats_m1, exclude.intercept = TRUE, stats.labels = FALSE, ylab = "") +
+  theme_classic() +
+  scale_y_discrete(labels = c("tiger leeches", "brown leeches", "sampling period", "on/off trail")) +
+  labs(title = "Family Muridae (rats) - Leech Counts by Partition")
+```
+
+model - leech counts plus ecological predictors
+```{r}
+rats_m2 <- glmmTMB(Number.of.Animals ~
+         z_picta_part +
+         z_zeylanica_part +
+         samplingperiod +
+         z_rain +                  
+         z_max +                   
+         z_min +
+         z_pheno_mod +
+         on.off.trail +
+         (1|partition.mod),
+         offset = log(active.days),
+         data = pruned_aggregated[pruned_aggregated$Species == "Unid Rat",],
+         family = nbinom2,
+         ziformula = ~1)
+
+summary(rats_m2)
+check_collinearity(rats_m2)
+
+ggcoefstats(rats_m2, exclude.intercept = TRUE, stats.labels = FALSE, ylab = "") +
+  theme_classic() +
+  scale_y_discrete(labels = c("tiger leeches", "brown leeches", "sampling period", "rainfall",
+                              "max temp", "min temp", "fruit", "on/off trail")) +
+  labs(title = "Family Muridae (rats) - All Predictors")
+```
+
+```{r}
+rats_m3 <- glmmTMB(Number.of.Animals ~
+         z_picta_part * z_rain +
+         z_zeylanica_part * z_rain +
+         samplingperiod +
+         z_rain +                  
+         z_max +                   
+         z_min +
+         z_pheno_mod +
+         on.off.trail +
+         (1|partition.mod),
+         offset = log(active.days),
+         data = pruned_aggregated[pruned_aggregated$Species == "Unid Rat",],
+         family = nbinom2,
+         ziformula = ~1)
+
+summary(rats_m3)
+check_collinearity(rats_m3)
+
+ggcoefstats(rats_m3, exclude.intercept = TRUE, stats.labels = FALSE, ylab = "") +
+  theme_classic() +
+  labs(title = "Family Muridae (rats) - All Predictors")
+```
+
+Ecological predictors only
+```{r}
+rats_m4 <- glmmTMB(Number.of.Animals ~
+         samplingperiod +
+         z_rain +                  
+         z_max +                   
+         z_min +
+         z_pheno_mod +
+         on.off.trail +
+         (1|partition.mod),
+         offset = log(active.days),
+         data = pruned_aggregated[pruned_aggregated$Species == "Unid Rat",],
+         family = nbinom2,
+         ziformula = ~1)
+```
+
+compare models
+```{r}
+#comparing models using AIC
+AIC(rats_m1, rats_m2, rats_m3, rats_m4)
+```
+
+
+### Bearded pigs - Sus barbatus
+
+```{r}
+hist(pruned$num_observed[pruned$Species == "Sus barbatus"])
+table(pruned$num_observed[pruned$Species == "Sus barbatus"])
+```
+
+model - leech counts only 
+```{r}
+pigs_m1 <- glmmTMB(Number.of.Animals ~
+         z_picta_part +
+         z_zeylanica_part +
+         samplingperiod + 
+         on.off.trail +
+         (1|partition.mod),
+         offset = log(active.days),
+         data = pruned_aggregated[pruned_aggregated$Species == "Sus barbatus",],
+         family = nbinom2,
+         ziformula = ~1)
+
+summary(pigs_m1)
+
+ggcoefstats(pigs_m1, exclude.intercept = TRUE, stats.labels = FALSE, ylab = "") +
+  theme_classic() +
+  scale_y_discrete(labels = c("tiger leeches", "brown leeches", "sampling period", "on/off trail")) +
+  xlim(-1.5, 0.5) + 
+  labs(title = "Sus barbatus - Leech Predictors Only")
+```
+
+model - leech counts plus ecological predictors
+```{r}
+pigs_m2 <- glmmTMB(Number.of.Animals ~
+         z_picta_part +
+         z_zeylanica_part +
+         samplingperiod +
+         z_rain +                  
+         z_max +                   
+         z_min +                   
+         z_pheno_mod +
+         on.off.trail +
+         (1|partition.mod) +
+         offset(log(active.days)),
+         data = pruned_aggregated[pruned_aggregated$Species == "Sus barbatus",],
+         family = nbinom2,
+         ziformula = ~1)
+
+summary(pigs_m2)
+check_collinearity(pigs_m2)
+
+ggcoefstats(pigs_m2, exclude.intercept = TRUE, stats.labels = FALSE, ylab = "") +
+  theme_classic() +
+  scale_y_discrete(labels = c("tiger leeches", "brown leeches", "sampling period", "rainfall",
+                              "max temp", "min temp", "fruit", "on/off trail")) +
+  labs(title = "Sus barbatus - All Predictors")
+```
+
+full model with interactions
+```{r}
+pigs_m3 <- glmmTMB(Number.of.Animals ~
+         z_picta_part * z_rain +
+         z_zeylanica_part * z_rain +
+         samplingperiod +
+         z_max +                   
+         z_min +                   
+         z_pheno_mod +
+         on.off.trail +
+         (1|partition.mod) +
+         offset(log(active.days)),
+         data = pruned_aggregated[pruned_aggregated$Species == "Sus barbatus",],
+         family = nbinom2,
+         ziformula = ~1)
+
+summary(pigs_m3)
+check_collinearity(pigs_m3)
+
+ggcoefstats(pigs_m3, exclude.intercept = TRUE, stats.labels = FALSE, ylab = "") +
+  theme_classic() +
+  labs(title = "Sus barbatus - All Predictors")
+```
+
+ecological only
+```{r}
+pigs_m4 <- glmmTMB(Number.of.Animals ~
+         samplingperiod +
+         z_rain +                  
+         z_max +                   
+         z_min +                   
+         z_pheno_mod +
+         on.off.trail +
+         (1|partition.mod) +
+         offset(log(active.days)),
+         data = pruned_aggregated[pruned_aggregated$Species == "Sus barbatus",],
+         family = nbinom2,
+         ziformula = ~1)
+```
+
+compare models
+```{r}
+AIC(pigs_m1, pigs_m2, pigs_m3, pigs_m4)
+```
+
+### Malayan Civet - Viverra tangalunga
+
+var < mean, underdispersed
+```{r}
+hist(pruned$num_observed[pruned$Species == "Viverra tangalunga"])
+table(pruned$num_observed[pruned$Species == "Viverra tangalunga"])
+```
+
+model - leech counts only 
+```{r}
+vtan_m1 <- glmmTMB(Number.of.Animals ~
+         z_picta_part +
+         z_zeylanica_part +
+         samplingperiod +
+         on.off.trail +
+         (1|partition.mod),
+         offset = log(active.days),
+         data = pruned_aggregated[pruned_aggregated$Species == "Viverra tangalunga",],
+         family = nbinom2,
+         ziformula = ~1)
+
+summary(vtan_m1)
+
+ggcoefstats(vtan_m1, exclude.intercept = TRUE, stats.labels = FALSE, ylab = "") +
+  theme_classic() +
+  scale_y_discrete(labels = c("tiger leeches", "brown leeches", "sampling period", "on/off trail")) +
+  labs(title = "Viverra tangalunga - Leech Predictors Only")
+```
+
+model - leech counts plus ecological predictors
+```{r}
+vtan_m2 <- glmmTMB(Number.of.Animals ~
+         z_picta_part +
+         z_zeylanica_part +
+         samplingperiod +
+         z_rain +                  
+         z_max +                   
+         z_min + 
+         z_pheno_mod +
+         on.off.trail +
+         (1|partition.mod),
+         offset = log(active.days),
+         data = pruned_aggregated[pruned_aggregated$Species == "Viverra tangalunga",],
+         family = nbinom2,
+         ziformula = ~1)
+
+summary(vtan_m2)
+check_collinearity(vtan_m2)
+
+ggcoefstats(vtan_m2, exclude.intercept = TRUE, stats.labels = FALSE, ylab = "") +
+  theme_classic() +
+  scale_y_discrete(labels = c("tiger leeches", "brown leeches", "sampling period", "rainfall",
+                              "max temp", "min temp", "fruit", "on/off trail")) +
+  labs(title = "Viverra tangalunga - All Predictors")
+```
+
+full model with interactions
+```{r}
+vtan_m3 <- glmmTMB(Number.of.Animals ~
+         z_picta_part * z_rain +
+         z_zeylanica_part * z_rain +
+         samplingperiod +
+         z_max +                   
+         z_min + 
+         z_pheno_mod +
+         on.off.trail +
+         (1|partition.mod),
+         offset = log(active.days),
+         data = pruned_aggregated[pruned_aggregated$Species == "Viverra tangalunga",],
+         family = nbinom2,
+         ziformula = ~1)
+
+summary(vtan_m3)
+check_collinearity(vtan_m3)
+
+ggcoefstats(vtan_m3, exclude.intercept = TRUE, stats.labels = FALSE, ylab = "") +
+  theme_classic() +
+  labs(title = "Viverra tangalunga - All Predictors")
+```
+
+```{r}
+vtan_m4 <- glmmTMB(Number.of.Animals ~
+         samplingperiod +
+         z_rain +                  
+         z_max +                   
+         z_min + 
+         z_pheno_mod +
+         on.off.trail +
+         (1|partition.mod),
+         offset = log(active.days),
+         data = pruned_aggregated[pruned_aggregated$Species == "Viverra tangalunga",],
+         family = nbinom2,
+         ziformula = ~1)
+```
+
+
+compare models
+```{r}
+AIC(vtan_m1, vtan_m2, vtan_m3, vtan_m4)
+```
+
+
+### Java Mouse Deer - Tragulus javanicus
+
+```{r}
+hist(pruned$num_observed[pruned$Species == "Tragulus javanicus"])
+table(pruned$num_observed[pruned$Species == "Tragulus javanicus"])
+```
+
+model - leech counts only. No reliable effect for either leech species
+```{r}
+tjav_m1 <- glmmTMB(Number.of.Animals ~
+         z_picta_part +
+         z_zeylanica_part +
+         samplingperiod +
+         on.off.trail +
+         (1|partition.mod),
+         offset = log(active.days),
+         data = pruned_aggregated[pruned_aggregated$Species == "Tragulus javanicus",],
+         family = nbinom2,
+         ziformula = ~1)
+
+summary(tjav_m1)
+
+ggcoefstats(tjav_m1, exclude.intercept = TRUE, stats.labels = FALSE, ylab = "") +
+  theme_classic() +
+  scale_y_discrete(labels = c("tiger leeches", "brown leeches", "sampling period", "on/off trail")) +
+  labs(title = "Tragulus javanicus - Leech Predictors Only")
+```
+
+model - leech counts plus ecological predictors. No reliable effects
+```{r}
+tjav_m2 <- glmmTMB(Number.of.Animals ~
+         z_picta_part +
+         z_zeylanica_part +
+         samplingperiod +
+         z_rain +                  
+         z_max +                   
+         z_min +                   
+         z_pheno_mod +
+         on.off.trail +
+         (1|partition.mod),
+         offset = log(active.days),
+         data = pruned_aggregated[pruned_aggregated$Species == "Tragulus javanicus",],
+         family = nbinom2,
+         ziformula = ~1)
+
+summary(tjav_m2)
+check_collinearity(tjav_m2)
+
+ggcoefstats(tjav_m2, exclude.intercept = TRUE, stats.labels = FALSE, ylab = "") +
+  theme_classic() +
+  scale_y_discrete(labels = c("tiger leeches", "sampling period", "rainfall",
+                              "max temp", "min temp", "fruit", "on/off trail")) +
+  labs(title = "Tragulus javanicus - All Predictors")
+```
+
+model with interactions
+```{r}
+tjav_m3 <- glmmTMB(Number.of.Animals ~
+         z_picta_part * z_rain +
+         #z_zeylanica_part * z_rain +  #highly correlated (VIF > 14)
+         samplingperiod +
+         z_max +                   
+         z_min +                   
+         z_pheno_mod +
+         on.off.trail +
+         (1|partition.mod),
+         offset = log(active.days),
+         data = pruned_aggregated[pruned_aggregated$Species == "Tragulus javanicus",],
+         family = nbinom2,
+         ziformula = ~1)
+
+summary(tjav_m3)
+check_collinearity(tjav_m3)
+
+ggcoefstats(tjav_m3, exclude.intercept = TRUE, stats.labels = FALSE, ylab = "") +
+  theme_classic() +
+  labs(title = "Tragulus javanicus - All Predictors")
+```
+
+ecological predictors only
+```{r}
+tjav_m4 <- glmmTMB(Number.of.Animals ~
+         samplingperiod +
+         z_rain +                  
+         z_max +                   
+         z_min +                   
+         z_pheno_mod +
+         on.off.trail +
+         (1|partition.mod),
+         offset = log(active.days),
+         data = pruned_aggregated[pruned_aggregated$Species == "Tragulus javanicus",],
+         family = nbinom2,
+         ziformula = ~1)
+```
+
+compare models
+```{r}
+AIC(tjav_m1, tjav_m2, tjav_m3, tjav_m4)
+```
+
+interaction plot
+```{r}
+plot_model(tjav_m3, type = "pred", terms = c("z_picta_part", "z_rain [minmax]")) +
+  theme_classic() +
+  labs(x = "tiger leech rate (z)", y = "mammal count", 
+       title = "leech X rainfall interaction", color = "rainfall (z)")
+```
+
+
+### Pig-tailed macaque - Macaca nemestrina
+
+```{r}
+hist(pruned$num_observed[pruned$Species == "Macaca nemestrina"])
+table(pruned$num_observed[pruned$Species == "Macaca nemestrina"])
+```
+
+model - leech counts only. No reliable effect of either leech species
+```{r}
+mnem_m1 <- glmmTMB(Number.of.Animals ~
+         z_picta_part +
+         z_zeylanica_part +
+         samplingperiod +
+         on.off.trail +
+         (1|partition.mod),
+         offset = log(active.days),
+         data = pruned_aggregated[pruned_aggregated$Species == "Macaca nemestrina",],
+         family = nbinom2,
+         ziformula = ~1)
+
+summary(mnem_m1)
+
+ggcoefstats(mnem_m1, exclude.intercept = TRUE, stats.labels = FALSE, ylab = "") +
+  theme_classic() +
+  scale_y_discrete(labels = c("tiger leeches", "brown leeches", "sampling period", "on/off trail")) +
+  labs(title = "Macaca nemestrina - Leech Predictors Only")
+```
+
+model - leech counts plus ecological predictors
+```{r}
+mnem_m2 <- glmmTMB(Number.of.Animals ~
+         z_picta_part +
+         z_zeylanica_part +
+         samplingperiod +
+         z_rain +                  
+         z_max +                   
+         z_min +                   
+         z_pheno_mod + 
+         on.off.trail +
+         (1|partition.mod),
+         offset = log(active.days),
+         data = pruned_aggregated[pruned_aggregated$Species == "Macaca nemestrina",],
+         family = nbinom2,
+         ziformula = ~1)
+
+summary(mnem_m2)
+check_collinearity(mnem_m2)
+
+ggcoefstats(mnem_m2, exclude.intercept = TRUE, stats.labels = FALSE, ylab = "") +
+  theme_classic() +
+  scale_y_discrete(labels = c("tiger leeches", "brown leeches", "sampling period", "rainfall",
+                              "max temp", "min temp", "fruit", "on/off trail")) +
+  labs(title = "Macaca nemestrina - All Predictors")
+```
+
+model with interactions
+```{r}
+mnem_m3 <- glmmTMB(Number.of.Animals ~
+         z_picta_part * z_rain +
+         z_zeylanica_part * z_rain +
+         samplingperiod +
+         z_max +                   
+         z_min +                   
+         z_pheno_mod + 
+         on.off.trail +
+         (1|partition.mod),
+         offset = log(active.days),
+         data = pruned_aggregated[pruned_aggregated$Species == "Macaca nemestrina",],
+         family = nbinom2,
+         ziformula = ~1)
+
+summary(mnem_m3)
+check_collinearity(mnem_m3)
+
+ggcoefstats(mnem_m3, exclude.intercept = TRUE, stats.labels = FALSE, ylab = "") +
+  theme_classic() +
+  labs(title = "Macaca nemestrina - All Predictors")
+```
+
+ecological only
+```{r}
+mnem_m4 <- glmmTMB(Number.of.Animals ~
+         samplingperiod +
+         z_rain +                  
+         z_max +                   
+         z_min +                   
+         z_pheno_mod + 
+         on.off.trail +
+         (1|partition.mod),
+         offset = log(active.days),
+         data = pruned_aggregated[pruned_aggregated$Species == "Macaca nemestrina",],
+         family = nbinom2,
+         ziformula = ~1)
+```
+
+compare models
+```{r}
+AIC(mnem_m1, mnem_m2, mnem_m3, mnem_m4)
+```
+
+
+## Modeling by groups
+
+### Grouping by family
+
+#### Cervidae
+
+Two species of Muntiacus, 1,372 total individuals, mostly M.muntjak (~60%)
+```{r}
+#n observations by species and by family
+table(pruned$Species[pruned$Family == "Cervidae" & pruned$num_observed != 0])
+length(pruned$Species[pruned$Family == "Cervidae" & pruned$num_observed != 0])
+
+table(pruned$habitat[pruned$Family == "Cervidae" & pruned$num_observed != 0])
+table(pruned$partition[pruned$Family == "Cervidae" & pruned$num_observed != 0])
+
+hist(pruned$num_observed[pruned$Family == "Cervidae"])
+table(pruned$num_observed[pruned$Family == "Cervidae"])
+```
+
+model - leech predictors
+```{r}
+cerv_m1 <- glmmTMB(Number.of.Animals ~
+         z_picta_part +
+         z_zeylanica_part +
+         samplingperiod +
+         on.off.trail +
+         (1|partition.mod),
+         offset = log(active.days),
+         data = pruned_aggregated[pruned_aggregated$Family == "Cervidae",],
+         family = nbinom2,
+         ziformula = ~1)
+
+summary(cerv_m1)
+
+ggcoefstats(cerv_m1, exclude.intercept = TRUE, stats.labels = FALSE, ylab = "") +
+  theme_classic() +
+  scale_y_discrete(labels = c("tiger leeches", "brown leeches", "sampling period", "on/off trail")) +
+  labs(title = "Cervidae - Leech Predictors Only")
+```
+
+model - leech counts plus ecological predictors
+```{r}
+cerv_m2 <- glmmTMB(Number.of.Animals ~
+         z_picta_part +
+         z_zeylanica_part +
+         samplingperiod +
+         on.off.trail +
+         z_rain +                  
+         z_max +                   
+         z_min +                   
+         z_pheno_mod +                 
+         (1|partition.mod) +
+         offset(log(active.days)),
+         data = pruned_aggregated[pruned_aggregated$Family == "Cervidae",],
+         family = nbinom2,
+         ziformula = ~1)
+
+summary(cerv_m2)
+check_collinearity(cerv_m2)
+
+ggcoefstats(cerv_m2, exclude.intercept = TRUE, stats.labels = FALSE, ylab = "") +
+  theme_classic() +
+  scale_y_discrete(labels = c("tiger leeches", "brown leeches", "sampling period", "on/off trail",
+                              "rainfall", "max temp", "min temp", "fruit")) +
+  labs(title = "Cervidae - All Predictors")
+```
+
+model - full plus interactions
+```{r}
+cerv_m3 <- glmmTMB(Number.of.Animals ~
+         z_picta_part * z_rain +
+         z_zeylanica_part * z_rain +
+         samplingperiod +
+         on.off.trail +
+         z_max +                   
+         z_min +                   
+         z_pheno_mod +                 
+         (1|partition.mod) +
+         offset(log(active.days)),
+         data = pruned_aggregated[pruned_aggregated$Family == "Cervidae",],
+         family = nbinom2,
+         ziformula = ~1)
+
+summary(cerv_m3)
+check_collinearity(cerv_m3)
+
+ggcoefstats(cerv_m3, exclude.intercept = TRUE, stats.labels = FALSE, ylab = "") +
+  theme_classic() +
+  labs(title = "Cervidae - All Predictors + interactions")
+```
+
+ecological only
+```{r}
+cerv_m4 <- glmmTMB(Number.of.Animals ~
+         samplingperiod +
+         on.off.trail +
+         z_rain +                  
+         z_max +                   
+         z_min +                   
+         z_pheno_mod +                 
+         (1|partition.mod) +
+         offset(log(active.days)),
+         data = pruned_aggregated[pruned_aggregated$Family == "Cervidae",],
+         family = nbinom2,
+         ziformula = ~1)
+```
+
+model comparison
+```{r}
+AIC(cerv_m1, cerv_m2, cerv_m3, cerv_m4)
+```
+
+
+#### Felidae
+
+Five species of Felids, 506 total individuals, mostly Neofelis (71%)
+```{r}
+#n observations by species and by family
+table(pruned$Species[pruned$Family == "Felidae" & pruned$num_observed != 0])
+length(pruned$Species[pruned$Family == "Felidae" & pruned$num_observed != 0])
+
+table(pruned$habitat[pruned$Family == "Felidae" & pruned$num_observed != 0])
+table(pruned$partition[pruned$Family == "Felidae" & pruned$num_observed != 0])
+
+hist(pruned$num_observed[pruned$Family == "Felidae"])
+table(pruned$num_observed[pruned$Family == "Felidae"])
+```
+
+model - leech predictors
+```{r}
+fel_m1 <- glmmTMB(Number.of.Animals ~
+         z_picta_part +
+         z_zeylanica_part +
+         samplingperiod +
+         on.off.trail +
+         (1|partition.mod),
+         offset = log(active.days),
+         data = pruned_aggregated[pruned_aggregated$Family == "Felidae",],
+         family = nbinom2,
+         ziformula = ~1)
+
+summary(fel_m1)
+
+ggcoefstats(fel_m1, exclude.intercept = TRUE, stats.labels = FALSE, ylab = "") +
+  theme_classic() +
+  scale_y_discrete(labels = c("tiger leeches", "brown leeches", "sampling period", "on/off trail")) +
+  labs(title = "Felidae - Leech Predictors Only")
+```
+
+model - leech counts plus ecological predictors 
+```{r}
+fel_m2 <- glmmTMB(Number.of.Animals ~
+         z_picta_part +
+         z_zeylanica_part +
+         samplingperiod +
+         on.off.trail +
+         z_rain +                  
+         z_max +                   
+         z_min +                   
+         z_pheno_mod +                 
+         (1|partition.mod),
+         offset = log(active.days),
+         data = pruned_aggregated[pruned_aggregated$Family == "Felidae",],
+         family = nbinom2,
+         ziformula = ~1)
+
+summary(fel_m2)
+check_collinearity(fel_m2)
+
+ggcoefstats(fel_m2, exclude.intercept = TRUE, stats.labels = FALSE, ylab = "") +
+  theme_classic() +
+  scale_y_discrete(labels = c("tiger leeches", "brown leeches", "sampling period", "on/off trail",
+                              "rainfall", "max temp", "min temp", "fruit")) +
+  labs(title = "Felidae - All Predictors")
+```
+
+model - full with interactions  
+```{r}
+fel_m3 <- glmmTMB(Number.of.Animals ~
+         z_picta_part * z_rain +
+         z_zeylanica_part * z_rain +
+         samplingperiod +
+         on.off.trail +
+         z_max +                   
+         z_min +                   
+         z_pheno_mod +                 
+         (1|partition.mod),
+         offset = log(active.days),
+         data = pruned_aggregated[pruned_aggregated$Family == "Felidae",],
+         family = nbinom2,
+         ziformula = ~1)
+
+summary(fel_m3)
+check_collinearity(fel_m3)
+
+ggcoefstats(fel_m3, exclude.intercept = TRUE, stats.labels = FALSE, ylab = "") +
+  theme_classic() +
+  labs(title = "Felidae - All Predictors")
+```
+
+ecological only
+```{r}
+fel_m4 <- glmmTMB(Number.of.Animals ~
+         samplingperiod +
+         on.off.trail +
+         z_rain +                  
+         z_max +                   
+         z_min +                   
+         z_pheno_mod +                 
+         (1|partition.mod),
+         offset = log(active.days),
+         data = pruned_aggregated[pruned_aggregated$Family == "Felidae",],
+         family = nbinom2,
+         ziformula = ~1)
+```
+
+model comparison
+```{r}
+AIC(fel_m1, fel_m2, fel_m3, fel_m4)
+```
+
+#### Hystricidae
+
+Two species of porcupines, 1,426 total individuals, nearly even between the two species
+```{r}
+#n observations by species and by family
+table(pruned$Species[pruned$Family == "Hystricidae" & pruned$num_observed != 0])
+length(pruned$Species[pruned$Family == "Hystricidae" & pruned$num_observed != 0])
+
+table(pruned$habitat[pruned$Family == "Hystricidae" & pruned$num_observed != 0])
+table(pruned$partition[pruned$Family == "Hystricidae" & pruned$num_observed != 0])
+
+hist(pruned$num_observed[pruned$Family == "Hystricidae"])
+table(pruned$num_observed[pruned$Family == "Hystricidae"])
+```
+
+model - leech predictors
+```{r}
+hyst_m1 <- glmmTMB(Number.of.Animals ~
+         z_picta_part +
+         z_zeylanica_part +
+         samplingperiod +
+         on.off.trail +
+         (1|partition.mod),
+         offset = log(active.days),
+         data = pruned_aggregated[pruned_aggregated$Family == "Hystricidae",],
+         family = nbinom2,
+         ziformula = ~1)
+
+summary(hyst_m1)
+
+ggcoefstats(hyst_m1, exclude.intercept = TRUE, stats.labels = FALSE, ylab = "") +
+  theme_classic() +
+  scale_y_discrete(labels = c("tiger leeches", "brown leeches", "sampling period", "on/off trail")) +
+  labs(title = "Hystricidae - Leech Predictors Only")
+```
+
+model - leech counts plus ecological predictors
+```{r}
+hyst_m2 <- glmmTMB(Number.of.Animals ~
+         z_picta_part +
+         z_zeylanica_part +
+         samplingperiod +
+         on.off.trail +
+         z_rain +                  
+         z_max +                   
+         z_min +                   
+         z_pheno_mod +                 
+         (1|partition.mod),
+         offset = log(active.days),
+         data = pruned_aggregated[pruned_aggregated$Family == "Hystricidae",],
+         family = nbinom2,
+         ziformula = ~1)
+
+summary(hyst_m2)
+check_collinearity(hyst_m2)
+
+ggcoefstats(hyst_m2, exclude.intercept = TRUE, stats.labels = FALSE, ylab = "") +
+  theme_classic() +
+  scale_y_discrete(labels = c("tiger leeches", "brown leeches", "sampling period", "on/off trail",
+                              "rainfall", "max temp", "min temp", "fruit")) +
+  labs(title = "Hystricidae - All Predictors")
+```
+
+model - full with interactions
+```{r}
+hyst_m3 <- glmmTMB(Number.of.Animals ~
+         z_picta_part * z_rain +
+         z_zeylanica_part * z_rain +
+         samplingperiod +
+         on.off.trail +
+         z_max +                   
+         z_min +                   
+         z_pheno_mod +                 
+         (1|partition.mod),
+         offset = log(active.days),
+         data = pruned_aggregated[pruned_aggregated$Family == "Hystricidae",],
+         family = nbinom2,
+         ziformula = ~1)
+
+summary(hyst_m3)
+check_collinearity(hyst_m3)
+
+ggcoefstats(hyst_m3, exclude.intercept = TRUE, stats.labels = FALSE, ylab = "") +
+  theme_classic() +
+  labs(title = "Hystricidae - All Predictors with interactions")
+```
+
+eco only
+```{r}
+hyst_m4 <- glmmTMB(Number.of.Animals ~
+         samplingperiod +
+         on.off.trail +
+         z_rain +                  
+         z_max +                   
+         z_min +                   
+         z_pheno_mod +                 
+         (1|partition.mod),
+         offset = log(active.days),
+         data = pruned_aggregated[pruned_aggregated$Family == "Hystricidae",],
+         family = nbinom2,
+         ziformula = ~1)
+```
+
+model comparison
+```{r}
+AIC(hyst_m1, hyst_m2, hyst_m3, hyst_m4)
+```
+
+#### Mustelidae
+
+Three species of mustelids, almost all Martes flavigula
+```{r}
+#n observations by species and by family
+table(pruned$Species[pruned$Family == "Mustelidae" & pruned$num_observed != 0])
+length(pruned$Species[pruned$Family == "Mustelidae" & pruned$num_observed != 0])
+
+table(pruned$habitat[pruned$Family == "Mustelidae" & pruned$num_observed != 0])
+table(pruned$partition[pruned$Family == "Mustelidae" & pruned$num_observed != 0])
+
+hist(pruned$num_observed[pruned$Family == "Mustelidae"])
+table(pruned$num_observed[pruned$Family == "Mustelidae"])
+```
+
+model - leech predictors
+```{r}
+must_m1 <- glmmTMB(Number.of.Animals ~
+         z_picta_part +
+         z_zeylanica_part +
+         on.off.trail +
+         samplingperiod +       
+         (1|partition.mod),
+         offset = log(active.days),
+         data = pruned_aggregated[pruned_aggregated$Family == "Mustelidae",],
+         family = nbinom2,
+         ziformula = ~1)
+
+summary(must_m1)
+
+ggcoefstats(must_m1, exclude.intercept = TRUE, stats.labels = FALSE, ylab = "") +
+  theme_classic() +
+  scale_y_discrete(labels = c("tiger leeches", "brown leeches", "sampling period", "on/off trail")) +
+  labs(title = "Mustelidae - Leech Predictors Only")
+```
+
+model - leech counts plus ecological predictors. No reliable predictors.
+```{r}
+must_m2 <- glmmTMB(Number.of.Animals ~
+         z_picta_part +
+         z_zeylanica_part +
+         samplingperiod +
+         on.off.trail +
+         z_rain +                  
+         z_max +                   
+         z_min +                   
+         z_pheno_mod +                 
+         (1|partition.mod) +
+         offset(log(active.days)),
+         data = pruned_aggregated[pruned_aggregated$Family == "Mustelidae",],
+         family = nbinom2,
+         ziformula = ~1)
+
+summary(must_m2)
+check_collinearity(must_m2)
+
+ggcoefstats(must_m2, exclude.intercept = TRUE, stats.labels = FALSE, ylab = "") +
+  theme_classic() +
+  scale_y_discrete(labels = c("tiger leeches", "brown leeches", "sampling period", "on/off trail",
+                              "rainfall", "max temp", "min temp", "fruit")) +
+  labs(title = "Mustelidae - All Predictors")
+```
+
+model - full with interactions
+```{r}
+must_m3 <- glmmTMB(Number.of.Animals ~
+         z_picta_part * z_rain +
+         z_zeylanica_part * z_rain +
+         samplingperiod +
+         on.off.trail +
+         z_max +                   
+         z_min +                   
+         z_pheno_mod +                 
+         (1|partition.mod) +
+         offset(log(active.days)),
+         data = pruned_aggregated[pruned_aggregated$Family == "Mustelidae",],
+         family = nbinom2,
+         ziformula = ~1)
+
+summary(must_m3)
+check_collinearity(must_m3)
+
+ggcoefstats(must_m3, exclude.intercept = TRUE, stats.labels = FALSE, ylab = "") +
+  theme_classic() +
+  labs(title = "Mustelidae - All Predictors w/ interactions")
+```
+
+eco only
+```{r}
+must_m4 <- glmmTMB(Number.of.Animals ~
+         samplingperiod +
+         on.off.trail +
+         z_rain +                  
+         z_max +                   
+         z_min +                   
+         z_pheno_mod +                 
+         (1|partition.mod) +
+         offset(log(active.days)),
+         data = pruned_aggregated[pruned_aggregated$Family == "Mustelidae",],
+         family = nbinom2,
+         ziformula = ~1)
+```
+
+model comparison
+```{r}
+AIC(must_m1, must_m2, must_m3, must_m4)
+```
+
+
+#### Sciuridae
+
+Ten species of squirels, some Unid, most are Lariscus insignis 
+```{r}
+#n observations by species and by family
+table(pruned$Species[pruned$Family == "Sciuridae" & pruned$num_observed != 0])
+length(pruned$Species[pruned$Family == "Sciuridae" & pruned$num_observed != 0])
+
+table(pruned$habitat[pruned$Family == "Sciuridae" & pruned$num_observed != 0])
+table(pruned$partition[pruned$Family == "Sciuridae" & pruned$num_observed != 0])
+
+hist(pruned$num_observed[pruned$Family == "Sciuridae"])
+table(pruned$num_observed[pruned$Family == "Sciuridae"])
+```
+
+model - leech predictors
+```{r}
+sciu_m1 <- glmmTMB(Number.of.Animals ~
+         z_picta_part +
+         z_zeylanica_part +
+         samplingperiod + 
+         on.off.trail +   
+         (1|partition.mod),
+         offset = log(active.days),
+         data = pruned_aggregated[pruned_aggregated$Family == "Sciuridae",],
+         family = nbinom2,
+         ziformula = ~1)
+
+summary(sciu_m1)
+
+ggcoefstats(sciu_m1, exclude.intercept = TRUE, stats.labels = FALSE, ylab = "") +
+  theme_classic() +
+  scale_y_discrete(labels = c("tiger leeches", "brown leeches", "sampling period", "on/off trail")) +
+  labs(title = "Sciuridae - Leech Predictors Only")
+```
+
+model - leech counts plus ecological predictors
+```{r}
+sciu_m2 <- glmmTMB(Number.of.Animals ~
+         z_picta_part +
+         z_zeylanica_part +
+         samplingperiod +
+         on.off.trail +
+         z_rain +                  
+         z_max +                   
+         z_min +                   
+         z_pheno_mod +                 
+         (1|partition.mod) +
+         offset(log(active.days)),
+         data = pruned_aggregated[pruned_aggregated$Family == "Sciuridae",],
+         family = nbinom2,
+         ziformula = ~1)
+
+summary(sciu_m2)
+check_collinearity(sciu_m2)
+
+ggcoefstats(sciu_m2, exclude.intercept = TRUE, stats.labels = FALSE, ylab = "") +
+  theme_classic() +
+  scale_y_discrete(labels = c("tiger leeches", "brown leeches", "sampling period", "on/off trail",
+                              "rainfall", "max temp", "min temp", "fruit")) +
+  labs(title = "Sciuridae - All Predictors")
+```
+
+model - full model with interactions
+```{r}
+sciu_m3 <- glmmTMB(Number.of.Animals ~
+         z_picta_part * z_rain +
+         z_zeylanica_part * z_rain +
+         samplingperiod +
+         on.off.trail +
+         z_max +                   
+         z_min +                   
+         z_pheno_mod +                 
+         (1|partition.mod) +
+         offset(log(active.days)),
+         data = pruned_aggregated[pruned_aggregated$Family == "Sciuridae",],
+         family = nbinom2,
+         ziformula = ~1)
+
+summary(sciu_m3)
+check_collinearity(sciu_m3)
+
+ggcoefstats(sciu_m3, exclude.intercept = TRUE, stats.labels = FALSE, ylab = "") +
+  theme_classic() +
+  labs(title = "Sciuridae - All Predictors w/ interactions")
+```
+
+interaction plot
+```{r}
+p1 <- plot_model(sciu_m3, type = "pred", terms = c("z_picta_part", "z_rain [minmax]")) +
+  theme_classic() +
+  labs(x = "tiger leech rate (z)", y = "mammal count", 
+       title = "picta X rainfall", color = "rainfall (z)") +
+  coord_cartesian(ylim = c(0, 3)) +
+  theme(legend.position = "bottom")
+
+p2 <- plot_model(sciu_m3, type = "pred", terms = c("z_zeylanica_part", "z_rain [minmax]")) +
+  theme_classic() +
+  labs(x = "brown leech rate (z)", y = "mammal count", 
+       title = "zeylanica X rainfall", color = "rainfall (z)") +
+  coord_cartesian(ylim = c(0, 3), xlim = c(-1, 1.5)) +
+  theme(legend.position = "bottom")
+
+grid.arrange(p1, p2, nrow = 1)
+```
+
+eco only
+```{r}
+sciu_m4 <- glmmTMB(Number.of.Animals ~
+         samplingperiod +
+         on.off.trail +
+         z_rain +                  
+         z_max +                   
+         z_min +                   
+         z_pheno_mod +                 
+         (1|partition.mod) +
+         offset(log(active.days)),
+         data = pruned_aggregated[pruned_aggregated$Family == "Sciuridae",],
+         family = nbinom2,
+         ziformula = ~1)
+```
+
+model comparison
+```{r}
+AIC(sciu_m1, sciu_m2, sciu_m3, sciu_m4)
+```
+
+
+#### Tragulidae
+
+Two species of Tragulidae, mostly T. javanicus
+```{r}
+#n observations by species and by family
+table(pruned$Species[pruned$Family == "Tragulidae" & pruned$num_observed != 0])
+length(pruned$Species[pruned$Family == "Tragulidae" & pruned$num_observed != 0])
+
+table(pruned$habitat[pruned$Family == "Tragulidae" & pruned$num_observed != 0])
+table(pruned$partition[pruned$Family == "Tragulidae" & pruned$num_observed != 0])
+
+hist(pruned$num_observed[pruned$Family == "Tragulidae"])
+table(pruned$num_observed[pruned$Family == "Tragulidae"])
+```
+
+model - leech predictors
+```{r}
+trag_m1 <- glmmTMB(Number.of.Animals ~
+         z_picta_part +
+         z_zeylanica_part +
+         samplingperiod +
+         on.off.trail +
+         (1|partition.mod),
+         offset = log(active.days),
+         data = pruned_aggregated[pruned_aggregated$Family == "Tragulidae",],
+         family = nbinom2,
+         ziformula = ~1)
+
+summary(trag_m1)
+
+ggcoefstats(trag_m1, exclude.intercept = TRUE, stats.labels = FALSE, ylab = "") +
+  theme_classic() +
+  scale_y_discrete(labels = c("tiger leeches", "brown leeches", "sampling period", "on/off trail")) +
+  labs(title = "Tragulidae - Leech Predictors Only")
+```
+
+model - leech counts plus ecological predictors
+```{r}
+trag_m2 <- glmmTMB(Number.of.Animals ~
+         z_picta_part +
+         z_zeylanica_part +
+         samplingperiod +
+         on.off.trail +
+         z_rain +                  
+         z_max +                   
+         z_min +                   
+         z_pheno_mod +                 
+         (1|partition.mod),
+         offset = log(active.days),
+         data = pruned_aggregated[pruned_aggregated$Family == "Tragulidae",],
+         family = nbinom2,
+         ziformula = ~1)
+
+summary(trag_m2)
+check_collinearity(trag_m2)
+
+ggcoefstats(trag_m2, exclude.intercept = TRUE, stats.labels = FALSE, ylab = "") +
+  theme_classic() +
+  scale_y_discrete(labels = c("tiger leeches", "brown leeches", "sampling period", "on/off trail",
+                              "rainfall", "max temp", "min temp", "fruit")) +
+  labs(title = "Tragulidae - All Predictors")
+```
+
+model - full model with interactions
+```{r}
+trag_m3 <- glmmTMB(Number.of.Animals ~
+         z_picta_part * z_rain +
+         #z_zeylanica_part * z_rain + #high correlation, VIF > 14
+         samplingperiod +
+         on.off.trail +
+         z_max +                   
+         z_min +                   
+         z_pheno_mod +                 
+         (1|partition.mod),
+         offset = log(active.days),
+         data = pruned_aggregated[pruned_aggregated$Family == "Tragulidae",],
+         family = nbinom2,
+         ziformula = ~1)
+
+summary(trag_m3)
+check_collinearity(trag_m3)
+
+ggcoefstats(trag_m3, exclude.intercept = TRUE, stats.labels = FALSE, ylab = "") +
+  theme_classic() +
+  labs(title = "Tragulidae - All Predictors w/ interactions")
+```
+
+interaction plot
+```{r}
+p1 <- plot_model(trag_m3, type = "pred", terms = c("z_picta_part", "z_rain [minmax]")) +
+  theme_classic() +
+  labs(x = "tiger leech rate (z)", y = "mammal count", 
+       title = "picta X rainfall", color = "rainfall (z)") +
+  coord_cartesian(ylim = c(0, 0.5)) +
+  theme(legend.position = "bottom")
+```
+
+
+eco only
+```{r}
+trag_m4 <- glmmTMB(Number.of.Animals ~
+         samplingperiod +
+         on.off.trail +
+         z_rain +                  
+         z_max +                   
+         z_min +                   
+         z_pheno_mod +                 
+         (1|partition.mod),
+         offset = log(active.days),
+         data = pruned_aggregated[pruned_aggregated$Family == "Tragulidae",],
+         family = nbinom2,
+         ziformula = ~1)
+```
+
+model comparison
+```{r}
+AIC(trag_m1, trag_m2, trag_m3, trag_m4)
+```
+
+interaction plot
+```{r}
+plot_model(trag_m3, type = "pred", terms = c("z_picta_part", "z_rain [minmax]")) +
+  theme_classic() +
+  labs(x = "tiger leech rate (z)", y = "mammal count", 
+       title = "leech X rainfall interaction", color = "rainfall (z)")
+```
+
+#### Viverridae
+
+Eight species of Viverridae, most are V.tangalunga
+```{r}
+#n observations by species and by family
+table(pruned$Species[pruned$Family == "Viverridae" & pruned$num_observed != 0])
+length(pruned$Species[pruned$Family == "Viverridae" & pruned$num_observed != 0])
+
+table(pruned$habitat[pruned$Family == "Viverridae" & pruned$num_observed != 0])
+table(pruned$partition[pruned$Family == "Viverridae" & pruned$num_observed != 0])
+
+hist(pruned$num_observed[pruned$Family == "Viverridae"])
+table(pruned$num_observed[pruned$Family == "Viverridae"])
+```
+
+model - leech predictors
+```{r}
+viv_m1 <- glmmTMB(Number.of.Animals ~
+         z_picta_part +
+         z_zeylanica_part +
+         samplingperiod + 
+         on.off.trail +
+         (1|partition.mod),
+         offset =log(active.days),
+         data = pruned_aggregated[pruned_aggregated$Family == "Viverridae",],
+         family = nbinom2,
+         ziformula = ~1)
+
+summary(viv_m1)
+
+ggcoefstats(viv_m1, exclude.intercept = TRUE, stats.labels = FALSE, ylab = "") +
+  theme_classic() +
+  scale_y_discrete(labels = c("tiger leeches", "brown leeches", "sampling period", "on/off trail")) +
+  labs(title = "Viverridae - Leech Predictors Only")
+```
+
+model - leech counts plus ecological predictors
+```{r}
+viv_m2 <- glmmTMB(Number.of.Animals ~
+         z_picta_part +
+         z_zeylanica_part +
+         samplingperiod +
+         on.off.trail +
+         z_rain +                  
+         z_max +                   
+         z_min +                   
+         z_pheno_mod +                 
+         (1|partition.mod) +
+         offset(log(active.days)),
+         data = pruned_aggregated[pruned_aggregated$Family == "Viverridae",],
+         family = nbinom2,
+         ziformula = ~1)
+
+summary(viv_m2)
+check_collinearity(viv_m2)
+
+ggcoefstats(viv_m2, exclude.intercept = TRUE, stats.labels = FALSE, ylab = "") +
+  theme_classic() +
+  scale_y_discrete(labels = c("tiger leeches", "brown leeches", "sampling period", "on/off trail",
+                              "rainfall", "max temp", "min temp", "fruit")) +
+  labs(title = "Viverridae - All Predictors")
+```
+
+model - full with interactions
+```{r}
+viv_m3 <- glmmTMB(Number.of.Animals ~
+         z_picta_part * z_rain +
+         z_zeylanica_part * z_rain +
+         samplingperiod +
+         on.off.trail +
+         z_max +                   
+         z_min +                   
+         z_pheno_mod +                 
+         (1|partition.mod) +
+         offset(log(active.days)),
+         data = pruned_aggregated[pruned_aggregated$Family == "Viverridae",],
+         family = nbinom2,
+         ziformula = ~1)
+
+summary(viv_m3)
+check_collinearity(viv_m3)
+
+ggcoefstats(viv_m3, exclude.intercept = TRUE, stats.labels = FALSE, ylab = "") +
+  theme_classic() +
+  labs(title = "Viverridae - All Predictors with interactions")
+```
+
+eco only
+```{r}
+viv_m4 <- glmmTMB(Number.of.Animals ~
+         samplingperiod +
+         on.off.trail +
+         z_rain +                  
+         z_max +                   
+         z_min +                   
+         z_pheno_mod +                 
+         (1|partition.mod) +
+         offset(log(active.days)),
+         data = pruned_aggregated[pruned_aggregated$Family == "Viverridae",],
+         family = nbinom2,
+         ziformula = ~1)
+```
+
+model comparison
+```{r}
+AIC(viv_m1, viv_m2, viv_m3, viv_m4)
+```
+
+
+### Grouping by functional groups
+
+#### Activity Cycle - Nocturnal
+
+21 species, 7,559 observations
+```{r}
+#observations by species
+table(pruned$Species[pruned$ActivityCycle == 1 & pruned$num_observed != 0])
+length(pruned$Species[pruned$ActivityCycle == 1 & pruned$num_observed != 0])
+
+table(pruned$habitat[pruned$ActivityCycle == 1 & pruned$num_observed != 0])
+table(pruned$partition[pruned$ActivityCycle == 1 & pruned$num_observed != 0])
+
+hist(pruned$num_observed[pruned$ActivityCycle == 1])
+table(pruned$num_observed[pruned$ActivityCycle == 1])
+```
+
+model with just leech predictors
+```{r}
+noct_m1 <- glmmTMB(Number.of.Animals ~
+         z_picta_part +
+         z_zeylanica_part +
+         samplingperiod +
+         on.off.trail +
+         (1|partition.mod) +
+         offset(log(active.days)),
+         data = pruned_aggregated[pruned_aggregated$ActivityCycle == 1,],
+         family = nbinom2,
+         ziformula = ~1)
+
+summary(noct_m1)
+
+ggcoefstats(noct_m1, exclude.intercept = TRUE, stats.labels = FALSE, ylab = "") +
+  theme_classic() +
+  scale_y_discrete(labels = c("tiger leeches", "brown leeches", "sampling period", "on/off trail")) +
+  labs(title = "Nocturnal Vertebrates - Leech Predictors Only")
+```
+
+model - leech counts plus ecological predictors 
+```{r}
+noct_m2 <- glmmTMB(Number.of.Animals ~
+         z_picta_part +
+         z_zeylanica_part +
+         samplingperiod +
+         on.off.trail +
+         z_rain +                  
+         z_max +                   
+         z_min +                   
+         z_pheno_mod +                 
+         (1|partition.mod) +
+         offset(log(active.days)),
+         data = pruned_aggregated[pruned_aggregated$ActivityCycle == 1,],
+         family = nbinom2,
+         ziformula = ~1)
+
+summary(noct_m2)
+check_collinearity(noct_m2)
+
+ggcoefstats(noct_m2, exclude.intercept = TRUE, stats.labels = FALSE, ylab = "") +
+  theme_classic() +
+  scale_y_discrete(labels = c("tiger leeches", "brown leeches", "sampling period", "on/off trail",
+                              "rainfall", "max temp", "min temp", "fruit")) +
+  labs(title = "Nocturnal Vertebrates - All Predictors")
+```
+
+model - full model with interactions
+```{r}
+noct_m3 <- glmmTMB(Number.of.Animals ~
+         z_picta_part * z_rain +
+         z_zeylanica_part * z_rain +
+         samplingperiod +
+         on.off.trail +
+         z_max +                   
+         z_min +                   
+         z_pheno_mod +                 
+         (1|partition.mod) +
+         offset(log(active.days)),
+         data = pruned_aggregated[pruned_aggregated$ActivityCycle == 1,],
+         family = nbinom2,
+         ziformula = ~1)
+
+summary(noct_m3)
+check_collinearity(noct_m3)
+
+ggcoefstats(noct_m3, exclude.intercept = TRUE, stats.labels = FALSE, ylab = "") +
+  theme_classic() +
+  labs(title = "Nocturnal Vertebrates - All Predictors with interactions")
+```
+
+eco only 
+```{r}
+noct_m4 <- glmmTMB(Number.of.Animals ~
+         samplingperiod +
+         on.off.trail +
+         z_rain +                  
+         z_max +                   
+         z_min +                   
+         z_pheno_mod +                 
+         (1|partition.mod) +
+         offset(log(active.days)),
+         data = pruned_aggregated[pruned_aggregated$ActivityCycle == 1,],
+         family = nbinom2,
+         ziformula = ~1)
+```
+
+model comparison
+```{r}
+AIC(noct_m1, noct_m2, noct_m3, noct_m4)
+```
+
+#### Activity Cycle - Crepuscular
+
+8 species, 4,029 observations. 56% are Sus barbatus
+```{r}
+#observations by species
+table(pruned$Species[pruned$ActivityCycle == 2 & pruned$num_observed != 0])
+length(pruned$Species[pruned$ActivityCycle == 2 & pruned$num_observed != 0])
+
+table(pruned$habitat[pruned$ActivityCycle == 2 & pruned$num_observed != 0])
+table(pruned$partition[pruned$ActivityCycle == 2 & pruned$num_observed != 0])
+
+hist(pruned$num_observed[pruned$ActivityCycle == 2])
+table(pruned$num_observed[pruned$ActivityCycle == 2])
+```
+
+model with just leech predictors - both leeches are reliable predictors 
+```{r}
+crep_m1 <- glmmTMB(Number.of.Animals ~
+         z_picta_part +
+         z_zeylanica_part +
+         samplingperiod + 
+         on.off.trail +
+         (1|partition.mod) +
+         offset(log(active.days)),
+         data = pruned_aggregated[pruned_aggregated$ActivityCycle == 2,],
+         family = nbinom2,
+         ziformula = ~1)
+
+summary(crep_m1)
+
+ggcoefstats(crep_m1, exclude.intercept = TRUE, stats.labels = FALSE, ylab = "") +
+  theme_classic() +
+  scale_y_discrete(labels = c("tiger leeches", "brown leeches", "sampling period", "on/off trail")) +
+  labs(title = "Crepuscular Vertebrates - Leech Predictors Only")
+```
+
+model - leech counts plus ecological predictors.
+```{r}
+crep_m2 <- glmmTMB(Number.of.Animals ~
+         z_picta_part +
+         z_zeylanica_part +
+         samplingperiod +
+         on.off.trail +
+         z_rain +                  
+         z_max +                   
+         z_min +                   
+         z_pheno_mod +                 
+         (1|partition.mod),
+         offset = log(active.days),
+         data = pruned_aggregated[pruned_aggregated$ActivityCycle == 2,],
+         family = nbinom2,
+         ziformula = ~1)
+
+summary(crep_m2)
+check_collinearity(crep_m2)
+
+ggcoefstats(crep_m2, exclude.intercept = TRUE, stats.labels = FALSE, ylab = "") +
+  theme_classic() +
+  scale_y_discrete(labels = c("tiger leeches", "brown leeches", "sampling period", "on/off trail",
+                              "rainfall", "max temp", "min temp", "fruit")) +
+  labs(title = "Crepuscular Vertebrates - All Predictors")
+```
+
+model - full model with interactions
+```{r}
+crep_m3 <- glmmTMB(Number.of.Animals ~
+         z_picta_part * z_rain +
+         z_zeylanica_part * z_rain +
+         samplingperiod +
+         on.off.trail +
+         z_max +                   
+         z_min +                   
+         z_pheno_mod +                 
+         (1|partition.mod),
+         offset = log(active.days),
+         data = pruned_aggregated[pruned_aggregated$ActivityCycle == 2,],
+         family = nbinom2,
+         ziformula = ~1)
+
+summary(crep_m3)
+check_collinearity(crep_m3)
+
+ggcoefstats(crep_m3, exclude.intercept = TRUE, stats.labels = FALSE, ylab = "") +
+  theme_classic() +
+  labs(title = "Crepuscular Vertebrates - All Predictors with interactions")
+```
+
+eco only
+```{r}
+crep_m4 <- glmmTMB(Number.of.Animals ~
+         samplingperiod +
+         on.off.trail +
+         z_rain +                  
+         z_max +                   
+         z_min +                   
+         z_pheno_mod +                 
+         (1|partition.mod),
+         offset = log(active.days),
+         data = pruned_aggregated[pruned_aggregated$ActivityCycle == 2,],
+         family = nbinom2,
+         ziformula = ~1)
+```
+
+model comparison
+```{r}
+AIC(crep_m1, crep_m2, crep_m3, crep_m4)
+```
+
+
+#### Activity Cycle - Diurnal
+
+23 species, 3,044 observations. 31% are M.nemestrina
+```{r}
+#observations by species
+table(pruned$Species[pruned$ActivityCycle == 3 & pruned$num_observed != 0])
+length(pruned$Species[pruned$ActivityCycle == 3 & pruned$num_observed != 0])
+
+table(pruned$habitat[pruned$ActivityCycle == 3 & pruned$num_observed != 0])
+table(pruned$partition[pruned$ActivityCycle == 3 & pruned$num_observed != 0])
+
+hist(pruned$num_observed[pruned$ActivityCycle == 3])
+table(pruned$num_observed[pruned$ActivityCycle == 3])
+```
+
+model with just leech predictors
+```{r}
+diur_m1 <- glmmTMB(Number.of.Animals ~
+         z_picta_part +
+         z_zeylanica_part +
+         samplingperiod + 
+         on.off.trail +
+         (1|partition.mod),
+         offset = log(active.days),
+         data = pruned_aggregated[pruned_aggregated$ActivityCycle == 3,],
+         family = nbinom2,
+         ziformula = ~1)
+
+summary(diur_m1)
+
+ggcoefstats(diur_m1, exclude.intercept = TRUE, stats.labels = FALSE, ylab = "") +
+  theme_classic() +
+  scale_y_discrete(labels = c("tiger leeches", "brown leeches", "sampling period", "on/off trail")) +
+  labs(title = "Diurnal Vertebrates - Leech Predictors Only")
+```
+
+model - leech counts plus ecological predictors.
+```{r}
+diur_m2 <- glmmTMB(Number.of.Animals ~
+         z_picta_part +
+         z_zeylanica_part +
+         samplingperiod +
+         on.off.trail +
+         z_rain +                  
+         z_max +                   
+         z_min +                   
+         z_pheno_mod +                 
+         (1|partition.mod),
+         offset = log(active.days),
+         data = pruned_aggregated[pruned_aggregated$ActivityCycle == 3,],
+         family = nbinom2,
+         ziformula = ~1)
+
+summary(diur_m2)
+check_collinearity(diur_m2)
+
+ggcoefstats(diur_m2, exclude.intercept = TRUE, stats.labels = FALSE, ylab = "") +
+  theme_classic() +
+  scale_y_discrete(labels = c("tiger leeches", "brown leeches", "sampling period", "on/off trail",
+                              "rainfall", "max temp", "min temp", "fruit")) +
+  labs(title = "Diurnal Vertebrates - All Predictors")
+```
+
+model - full model with interactions
+```{r}
+diur_m3 <- glmmTMB(Number.of.Animals ~
+         z_picta_part * z_rain +
+         z_zeylanica_part * z_rain +
+         samplingperiod +
+         on.off.trail +
+         z_max +                   
+         z_min +                   
+         z_pheno_mod +                 
+         (1|partition.mod),
+         offset = log(active.days),
+         data = pruned_aggregated[pruned_aggregated$ActivityCycle == 3,],
+         family = nbinom2,
+         ziformula = ~1)
+
+summary(diur_m3)
+check_collinearity(diur_m3)
+
+ggcoefstats(diur_m3, exclude.intercept = TRUE, stats.labels = FALSE, ylab = "") +
+  theme_classic() +
+  labs(title = "Diurnal Vertebrates - All Predictors with interactions")
+```
+
+eco only
+```{r}
+diur_m4 <- glmmTMB(Number.of.Animals ~
+         samplingperiod +
+         on.off.trail +
+         z_rain +                  
+         z_max +                   
+         z_min +                   
+         z_pheno_mod +                 
+         (1|partition.mod),
+         offset = log(active.days),
+         data = pruned_aggregated[pruned_aggregated$ActivityCycle == 3,],
+         family = nbinom2,
+         ziformula = ~1)
+```
+
+model comparison
+```{r}
+AIC(diur_m1, diur_m2, diur_m3, diur_m4)
+```
+
+
+#### Trophic Level - Herbivore
+
+13 species, 5,598 observations
+```{r}
+#observations by species
+table(pruned$Species[pruned$TrophicLevel == 1])
+length(pruned$Species[pruned$TrophicLevel == 1])
+
+table(pruned$habitat[pruned$TrophicLevel == 1])
+table(pruned$partition[pruned$TrophicLevel == 1])
+
+hist(pruned$num_observed[pruned$TrophicLevel == 1])
+table(pruned$num_observed[pruned$TrophicLevel == 1])
+```
+
+model with just leech predictors
+```{r}
+herb_m1 <- glmmTMB(Number.of.Animals ~
+         z_picta_part +
+         z_zeylanica_part +
+         samplingperiod +
+         on.off.trail +
+         (1|partition.mod),
+         offset = log(active.days),
+         data = pruned_aggregated[pruned_aggregated$TrophicLevel == 1,],
+         family = nbinom2,
+         ziformula = ~1)
+
+summary(herb_m1)
+
+ggcoefstats(herb_m1, exclude.intercept = TRUE, stats.labels = FALSE, ylab = "") +
+  theme_classic() +
+  scale_y_discrete(labels = c("tiger leeches", "brown leeches", "sampling period", "on/off trail")) +
+  labs(title = "Herbivorous Vertebrates - Leech Predictors Only")
+```
+
+model - leech counts plus ecological predictors
+```{r}
+herb_m2 <- glmmTMB(Number.of.Animals ~
+         z_picta_part +
+         z_zeylanica_part +
+         samplingperiod +
+         on.off.trail +
+         z_rain +                  
+         z_max +                   
+         z_min +                   
+         z_pheno_mod +                 
+         (1|partition.mod) +
+         offset(log(active.days)),
+         data = pruned_aggregated[pruned_aggregated$TrophicLevel == 1,],
+         family = nbinom2,
+         ziformula = ~1)
+
+summary(herb_m2)
+check_collinearity(herb_m2)
+
+ggcoefstats(herb_m2, exclude.intercept = TRUE, stats.labels = FALSE, ylab = "") +
+  theme_classic() +
+  scale_y_discrete(labels = c("tiger leeches", "brown leeches", "sampling period", "on/off trail",
+                              "rainfall", "max temp", "min temp", "fruit")) +
+  labs(title = "Herbivorous Vertebrates - All Predictors")
+```
+
+model - full plus interactions
+```{r}
+herb_m3 <- glmmTMB(Number.of.Animals ~
+         z_picta_part * z_rain +
+         z_zeylanica_part * z_rain +
+         samplingperiod +
+         on.off.trail +
+         z_max +                   
+         z_min +                   
+         z_pheno_mod +                 
+         (1|partition.mod) +
+         offset(log(active.days)),
+         data = pruned_aggregated[pruned_aggregated$TrophicLevel == 1,],
+         family = nbinom2,
+         ziformula = ~1)
+
+summary(herb_m3)
+check_collinearity(herb_m3)
+
+ggcoefstats(herb_m3, exclude.intercept = TRUE, stats.labels = FALSE, ylab = "") +
+  theme_classic() +
+  labs(title = "Herbivorous Vertebrates - All Predictors with interactions")
+```
+
+eco only
+```{r}
+herb_m4 <- glmmTMB(Number.of.Animals ~
+         samplingperiod +
+         on.off.trail +
+         z_rain +                  
+         z_max +                   
+         z_min +                   
+         z_pheno_mod +                 
+         (1|partition.mod) +
+         offset(log(active.days)),
+         data = pruned_aggregated[pruned_aggregated$TrophicLevel == 1,],
+         family = nbinom2,
+         ziformula = ~1)
+```
+
+model comparison
+```{r}
+AIC(herb_m1, herb_m2, herb_m3, herb_m4)
+```
+
+
+#### Trophic Level - Omnivore
+
+30 species, 9,510 observations
+```{r}
+#observations by species
+table(pruned$Species[pruned$TrophicLevel == 2])
+length(pruned$Species[pruned$TrophicLevel == 2])
+
+table(pruned$habitat[pruned$TrophicLevel == 2])
+table(pruned$partition[pruned$TrophicLevel == 2])
+
+hist(pruned$num_observed[pruned$TrophicLevel == 2])
+table(pruned$num_observed[pruned$TrophicLevel == 2])
+```
+
+model with just leech predictors
+```{r}
+omni_m1 <- glmmTMB(Number.of.Animals ~
+         z_picta_part +
+         z_zeylanica_part +
+         samplingperiod +
+         on.off.trail +
+         (1|partition.mod),
+         offset = log(active.days),
+         data = pruned_aggregated[pruned_aggregated$TrophicLevel == 2,],
+         family = nbinom2,
+         ziformula = ~1)
+
+summary(omni_m1)
+
+ggcoefstats(omni_m1, exclude.intercept = TRUE, stats.labels = FALSE, ylab = "") +
+  theme_classic() +
+  scale_y_discrete(labels = c("tiger leeches", "brown leeches", "sampling period", "on/off trail")) +
+  labs(title = "Omnivorous Vertebrates - Leech Predictors Only")
+```
+
+model - leech counts plus ecological predictors.
+```{r}
+omni_m2 <- glmmTMB(Number.of.Animals ~
+         z_picta_part +
+         z_zeylanica_part +
+         samplingperiod +
+         on.off.trail +
+         z_rain +                  
+         z_max +                   
+         z_min +                   
+         z_pheno_mod +                 
+         (1|partition.mod) +
+         offset(log(active.days)),
+         data = pruned_aggregated[pruned_aggregated$TrophicLevel == 2,],
+         family = nbinom2,
+         ziformula = ~1)
+
+summary(omni_m2)
+check_collinearity(omni_m2)
+
+ggcoefstats(omni_m2, exclude.intercept = TRUE, stats.labels = FALSE, ylab = "") +
+  theme_classic() +
+  scale_y_discrete(labels = c("tiger leeches", "brown leeches", "sampling period", "on/off trail",
+                              "rainfall", "max temp", "min temp", "fruit")) +
+  labs(title = "Omnivorous Vertebrates - All Predictors")
+```
+
+model - full model with interactions
+```{r}
+omni_m3 <- glmmTMB(Number.of.Animals ~
+         z_picta_part * z_rain +
+         z_zeylanica_part * z_rain +
+         samplingperiod +
+         on.off.trail +
+         z_max +                   
+         z_min +                   
+         z_pheno_mod +                 
+         (1|partition.mod) +
+         offset(log(active.days)),
+         data = pruned_aggregated[pruned_aggregated$TrophicLevel == 2,],
+         family = nbinom2,
+         ziformula = ~1)
+
+summary(omni_m3)
+check_collinearity(omni_m3)
+
+ggcoefstats(omni_m3, exclude.intercept = TRUE, stats.labels = FALSE, ylab = "") +
+  theme_classic() +
+  labs(title = "Omnivorous Vertebrates - All Predictors")
+```
+
+eco only
+```{r}
+omni_m4 <- glmmTMB(Number.of.Animals ~
+         samplingperiod +
+         on.off.trail +
+         z_rain +                  
+         z_max +                   
+         z_min +                   
+         z_pheno_mod +                 
+         (1|partition.mod) +
+         offset(log(active.days)),
+         data = pruned_aggregated[pruned_aggregated$TrophicLevel == 2,],
+         family = nbinom2,
+         ziformula = ~1)
+```
+
+model comparison
+```{r}
+AIC(omni_m1, omni_m2, omni_m3, omni_m4)
+```
+
+
+#### Trophic Level - Carnivore
+
+9 species, 1,231 observations
+```{r}
+#observations by species
+table(pruned$Species[pruned$TrophicLevel == 3])
+length(pruned$Species[pruned$TrophicLevel == 3])
+
+table(pruned$habitat[pruned$TrophicLevel == 3])
+table(pruned$partition[pruned$TrophicLevel == 3])
+
+hist(pruned$num_observed[pruned$TrophicLevel == 3])
+table(pruned$num_observed[pruned$TrophicLevel == 3])
+```
+
+model with just leech predictors
+```{r}
+carn_m1 <- glmmTMB(Number.of.Animals ~
+         z_picta_part +
+         z_zeylanica_part +
+         samplingperiod +  
+         on.off.trail +
+         (1|partition.mod),
+         offset = log(active.days),
+         data = pruned_aggregated[pruned_aggregated$TrophicLevel == 3,],
+         family = nbinom2,
+         ziformula = ~1)
+
+summary(carn_m1)
+
+ggcoefstats(carn_m1, exclude.intercept = TRUE, stats.labels = FALSE, ylab = "") +
+  theme_classic() +
+  scale_y_discrete(labels = c("tiger leeches", "brown leeches", "sampling period", "on/off trail")) +
+  labs(title = "Carnivorous Vertebrates - Leech Predictors Only")
+```
+
+model - leech counts plus ecological predictors.
+```{r}
+carn_m2 <- glmmTMB(Number.of.Animals ~
+         z_picta_part +
+         z_zeylanica_part +
+         samplingperiod +
+         on.off.trail +
+         z_rain +                  
+         z_max +                   
+         z_min +                   
+         z_pheno_mod +                 
+         (1|partition.mod) +
+         offset(log(active.days)),
+         data = pruned_aggregated[pruned_aggregated$TrophicLevel == 3,],
+         family = nbinom2,
+         ziformula = ~1)
+
+summary(carn_m2)
+check_collinearity(carn_m2)
+
+ggcoefstats(carn_m2, exclude.intercept = TRUE, stats.labels = FALSE, ylab = "") +
+  theme_classic() +
+  scale_y_discrete(labels = c("tiger leeches", "brown leeches", "sampling period", "on/off trail",
+                              "rainfall", "max temp", "min temp", "fruit")) +
+  labs(title = "Carnivorous Vertebrates - All Predictors")
+```
+
+model - full model with interactions
+```{r}
+carn_m3 <- glmmTMB(Number.of.Animals ~
+         z_picta_part * z_rain +
+         z_zeylanica_part * z_rain +
+         samplingperiod +
+         on.off.trail +
+         z_max +                   
+         z_min +                   
+         z_pheno_mod +                 
+         (1|partition.mod) +
+         offset(log(active.days)),
+         data = pruned_aggregated[pruned_aggregated$TrophicLevel == 3,],
+         family = nbinom2,
+         ziformula = ~1)
+
+summary(carn_m3)
+check_collinearity(carn_m3)
+
+ggcoefstats(carn_m3, exclude.intercept = TRUE, stats.labels = FALSE, ylab = "") +
+  theme_classic() +
+  labs(title = "Carnivorous Vertebrates - All Predictors")
+```
+
+```{r}
+carn_m4 <- glmmTMB(Number.of.Animals ~
+         samplingperiod +
+         on.off.trail +
+         z_rain +                  
+         z_max +                   
+         z_min +                   
+         z_pheno_mod +                 
+         (1|partition.mod) +
+         offset(log(active.days)),
+         data = pruned_aggregated[pruned_aggregated$TrophicLevel == 3,],
+         family = nbinom2,
+         ziformula = ~1)
+```
+
+model comparison
+```{r}
+AIC(carn_m1, carn_m2, carn_m3, carn_m4)
+```
+
+
+## Visualizing effect of leeches across models
+
+#### full models
+
+```{r}
+#model list - full models
+model_list <- list(mod2, rats_m2, pigs_m2, vtan_m2, tjav_m2, mnem_m2, cerv_m2, fel_m2, hyst_m2, must_m2, sciu_m2, trag_m2, viv_m2, noct_m2, crep_m2, diur_m2, herb_m2, omni_m2, carn_m2)
+
+#extract leech coefficients
+coef_list <- lapply(model_list, function(model) {
+  as.data.frame(summary(model)$coefficients$cond[c("z_zeylanica_part", "z_picta_part"), ])
+})
+
+#combine coefs into data frame
+coef_df <- do.call(rbind, coef_list)
+
+#add model names
+coef_df$model <- rep(c("All Mammals", "Unidentified Rats", "Bearded Pig", "Malay Civet", "Mouse Deer", "Pig-tailed Macaque",  "Cervidae",  "Felidae", "Hystricidae", "Mustelidae", "Sciuridae", "Tragulidae", "Viverridae", "Nocturnal", "Crepuscular", "Diurnal", "Herbivores", "Omnivores", "Carnivores"), each = 2)
+
+#add leech names
+coef_df$predictor <- rep(c("brown leech", "tiger leech"), times = length(model_list))
+
+#add confidence intervals
+coef_df$conf.low <- coef_df$Estimate - 1.96 * coef_df$`Std. Error`
+coef_df$conf.high <- coef_df$Estimate + 1.96 * coef_df$`Std. Error`
+coef_df$conf.low_50 <- coef_df$Estimate - 0.674 * coef_df$`Std. Error`
+coef_df$conf.high_50 <- coef_df$Estimate + 0.674 * coef_df$`Std. Error`
+
+
+#plot
+coef_df %>%
+  mutate(model = factor(model, levels = coef_df %>%
+                          filter(predictor == "tiger leech") %>%
+                          arrange(Estimate) %>%
+                          pull(model))) %>%
+ggplot(aes(x = model, y = Estimate, color = predictor)) +
+  geom_point(position = position_dodge(width = 0.5)) +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0, 
+                position = position_dodge(width = 0.5)) +
+  geom_errorbar(aes(ymin = conf.low_50, ymax = conf.high_50), width = 0, 
+                position = position_dodge(width = 0.5), size = 1.1) +
+  theme_classic() +
+  labs(title = "", y = "coefficient estimate") +
+  coord_flip() +  
+  scale_color_manual(values = c("tiger leech" = "orange", "brown leech" = "brown")) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey60") +  
+  theme(axis.title.y = element_blank(),  
+        legend.title = element_blank(),
+        legend.position = c(0.85, 0.45)) +
+  guides(color = guide_legend(reverse = TRUE))
+
+#ggsave(filename = "LeechEffects_Multiplot.jpg", width = 4, height = 5, dpi = 350)
+```
+
+
+### Rainfall threshold models
+```{r}
+#function to refit models using different rain thresholds
+refit_model_with_rain_filter <- function(model, data, threshold = "all") {
+  cutoff <- switch(threshold,
+                   "top50" = quantile(data$z_rain, 0.5, na.rm = TRUE),  #top half rainy periods
+                   "top25" = quantile(data$z_rain, 0.75, na.rm = TRUE), #top quarter rainy periods
+                   -Inf) 
+  
+  filtered_data <- if (threshold == "all") data else filter(data, z_rain > cutoff)
+  
+  update(model, data = filtered_data)
+}
+
+#add model names
+names(model_list) <- c("All Mammals", "Rats", "Pigs", "Malay Civet", "Mouse Deer", "PT Macaque", "Cervidae", "Felidae", "Hystricidae", "Mustelidae", "Sciuridae", "Tragulidae", "Viverridae", "Nocturnal", "Crepuscular", "Diurnal", "Herbivores", "Omnivores", "Carnivores")
+
+#create data list
+data_list <- list(
+  pruned_aggregated,
+  pruned_aggregated[pruned_aggregated$Species == "Unid Rat",],
+  pruned_aggregated[pruned_aggregated$Species == "Sus barbatus",],
+  pruned_aggregated[pruned_aggregated$Species == "Viverra tangalunga",],
+  pruned_aggregated[pruned_aggregated$Species == "Tragulus javanicus",],
+  pruned_aggregated[pruned_aggregated$Species == "Macaca nemestrina",],
+  pruned_aggregated[pruned_aggregated$Family == "Cervidae",],  
+  pruned_aggregated[pruned_aggregated$Family == "Felidae",],
+  pruned_aggregated[pruned_aggregated$Family == "Hystricidae",],
+  pruned_aggregated[pruned_aggregated$Family == "Mustelidae",],
+  pruned_aggregated[pruned_aggregated$Family == "Sciuridae",],
+  pruned_aggregated[pruned_aggregated$Family == "Tragulidae",],
+  pruned_aggregated[pruned_aggregated$Family == "Viverridae",],
+  pruned_aggregated[pruned_aggregated$ActivityCycle == 1,],
+  pruned_aggregated[pruned_aggregated$ActivityCycle == 2,],
+  pruned_aggregated[pruned_aggregated$ActivityCycle == 3,],
+  pruned_aggregated[pruned_aggregated$TrophicLevel == 1,],
+  pruned_aggregated[pruned_aggregated$TrophicLevel == 2,],
+  pruned_aggregated[pruned_aggregated$TrophicLevel == 3,])
+
+
+#define predictors of interest
+predictors_of_interest <- c("z_picta_part", "z_zeylanica_part")
+thresholds <- c("all", "top50", "top25")
+results_list <- list()
+
+#loop over both models
+for (i in seq_along(model_list)) {
+  model <- model_list[[i]]
+  species_name <- names(model_list)[i]
+  data <- data_list[[i]]
+  
+  for (thresh in thresholds) {
+    cutoff <- switch(thresh,
+                     "top50" = quantile(data$z_rain, 0.5, na.rm = TRUE),
+                     "top25" = quantile(data$z_rain, 0.75, na.rm = TRUE),
+                     -Inf)
+    
+    filtered_data <- if (thresh == "all") data else dplyr::filter(data, z_rain > cutoff)
+    
+    mod_refit <- update(model, data = filtered_data)
+    
+    coefs <- broom.mixed::tidy(mod_refit, effects = "fixed") %>%
+      filter(term %in% predictors_of_interest) %>%
+      mutate(species = species_name, threshold = thresh)
+    
+    results_list[[paste(species_name, thresh, sep = "_")]] <- coefs
+  }
+}
+
+#combine
+coef_df <- dplyr::bind_rows(results_list)
+coef_df$estimate
+
+#add confidence intervals
+coef_df$conf.low <- coef_df$estimate - 1.96 * coef_df$std.error
+coef_df$conf.high <- coef_df$estimate + 1.96 * coef_df$std.error
+coef_df$conf.low_50 <- coef_df$estimate - 0.674 * coef_df$std.error
+coef_df$conf.high_50 <- coef_df$estimate + 0.674 * coef_df$std.error
+
+#plot
+coef_df %>%
+  mutate(species = case_when(species == "PT Macaque" ~ "Pig-tailed Macaque", TRUE ~ species),
+         species = case_when(species == "Pigs" ~ "Bearded Pig", TRUE ~ species),
+         species = case_when(species == "Rats" ~ "Unidentified Rats", TRUE ~ species),
+    threshold = factor(threshold, levels = c("all", "top50", "top25")),
+    species = factor(species, levels = rev(unique(species)))) %>%
+  ggplot(aes(x = species, y = estimate, color = threshold)) +
+  geom_point(position = position_dodge(width = 0.5)) +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0, 
+                position = position_dodge(width = 0.5)) +
+  geom_errorbar(aes(ymin = conf.low_50, ymax = conf.high_50), width = 0, 
+                position = position_dodge(width = 0.5), size = 1.1) +
+  coord_flip() + 
+  facet_wrap(~ term, scales = "free_x",
+             labeller = as_labeller(c(
+  "z_picta_part" = "Effect of Tiger Leech",
+  "z_zeylanica_part" = "Effect of Brown Leech"))) + 
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray60") +
+  labs(x = "", y = "coefficient estimate", 
+  title = "",
+    color = "rainfall threshold") +
+  theme_classic(base_size = 12) +
+  theme(panel.grid.major.y = element_blank(),
+        axis.text.y = element_text(size = 10),
+        strip.background = element_blank(),
+        legend.position = "bottom") +
+  guides(color = guide_legend(reverse = TRUE))
+
+#ggsave("RainThresholdPlot.jpg", width = 6, height = 7, dpi = 300)
+```
+
+AICc table comparing models at different rain levels: with leech predictors (full model) and without (leech only, eco vars only)
+```{r eval=FALSE, include=FALSE}
+#results list
+aic_results <- list()
+
+#loop through models
+for (i in seq_along(model_list)) {
+  model <- model_list[[i]]
+  species_name <- names(model_list)[i]
+  data <- data_list[[i]]
+  
+  aic_entry <- list(Species = species_name)
+  
+  for (thresh in thresholds) {
+    cutoff <- switch(thresh,
+                     "top50" = quantile(data$z_rain, 0.5, na.rm = TRUE),
+                     "top25" = quantile(data$z_rain, 0.75, na.rm = TRUE),
+                     -Inf)
+    
+    filtered_data <- if (thresh == "all") data else dplyr::filter(data, z_rain > cutoff)
+    
+    full_model <- update(model, data = filtered_data)
+    full_aic <- AICc(full_model)
+    
+    reduced_formula <- update(formula(model), paste(". ~ . -", paste(predictors_of_interest, 
+                                                                     collapse = " - ")))
+    reduced_model <- glmmTMB::glmmTMB(formula = reduced_formula, data = filtered_data, 
+                                      family = family(model))
+    reduced_aic <- AICc(reduced_model)
+    
+    aic_entry[[paste0("AICc_", thresh)]] <- full_aic
+    aic_entry[[paste0("AICc_noleech_", thresh)]] <- reduced_aic
+  }
+  
+  aic_results[[species_name]] <- aic_entry
+}
+
+#make dataframe
+aic_table <- do.call(rbind, lapply(aic_results, as.data.frame))
+rownames(aic_table) <- NULL
+
+#which model had the lower AIC for each threshold
+aic_table$lower_all <- ifelse(aic_table$AIC_all < aic_table$AIC_noleech_all, "full", "no_leech")
+aic_table$lower_top50 <- ifelse(aic_table$AIC_top50 < aic_table$AIC_noleech_top50, "full", "no_leech")
+aic_table$lower_top25 <- ifelse(aic_table$AIC_top25 < aic_table$AIC_noleech_top25, "full", "no_leech")
+
+aic_table <- aic_table[, c("Species", 
+                           "AIC_all", "AIC_noleech_all", "lower_all",
+                           "AIC_top50", "AIC_noleech_top50", "lower_top50",
+                           "AIC_top25", "AIC_noleech_top25", "lower_top25")]
+
+colnames(aic_table) <- c("Species", "all", "all_nl", "low_all", "50", 
+                         "50_nl", "low_50", "25", "25_nl", "low_25")
+
+aic_table[] <- lapply(aic_table, function(x) if (is.numeric(x)) round(x, 1) else x)
+
+aic_table
+```
+
+again but fitting models minus one of each leech predictor in addition to both
+```{r}
+#define leech predictors 
+zey_predictor <- "z_zeylanica_part"
+picta_predictor <- "z_picta_part"
+both_predictors <- c(zey_predictor, picta_predictor)
+
+#results list
+aic_results <- list()
+
+#loop 
+for (i in seq_along(model_list)) {
+  model <- model_list[[i]]
+  species_name <- names(model_list)[i]
+  data <- data_list[[i]]
+  
+  aic_entry <- list(Species = species_name)
+  
+  for (thresh in thresholds) {
+    #filter by rainfall threshold
+    cutoff <- switch(thresh,
+                     "top50" = quantile(data$z_rain, 0.5, na.rm = TRUE),
+                     "top25" = quantile(data$z_rain, 0.75, na.rm = TRUE),
+                     -Inf)
+    
+    filtered_data <- if (thresh == "all") data else dplyr::filter(data, z_rain > cutoff)
+    response_var <- deparse(formula(model)[[2]])
+    aic_vals <- list()
+    
+    #full model
+    mod_full <- update(model, data = filtered_data)
+    aic_vals$full <- AICc(mod_full)
+    
+    #no zeylanica
+    #form_no_zey <- update(formula(model), paste(". ~ . -", zey_predictor))
+    #mod_no_zey <- glmmTMB::glmmTMB(formula = form_no_zey, data = filtered_data, family = family(model))
+    #aic_vals$no_zeylanica <- AICc(mod_no_zey)
+    
+    #no picta
+    #form_no_picta <- update(formula(model), paste(". ~ . -", picta_predictor))
+    #mod_no_picta <- glmmTMB::glmmTMB(formula = form_no_picta, data = filtered_data, family = family(model))
+    #aic_vals$no_picta <- AICc(mod_no_picta)
+    
+    #no leeches - eco vars only
+    form_no_leech <- update(formula(model), paste(". ~ . -", paste(both_predictors, collapse = " - ")))
+    mod_no_leech <- glmmTMB::glmmTMB(formula = form_no_leech, data = filtered_data, family = family(model))
+    aic_vals$no_leech <- AICc(mod_no_leech)
+    
+    #leech-only (picta + zeylanica)
+    form_leech_only <- as.formula(paste(response_var, "~", paste(both_predictors, collapse = " + ")))
+    mod_leech_only <- glmmTMB::glmmTMB(formula = form_leech_only, data = filtered_data, family = family(model))
+    aic_vals$leech_only <- AICc(mod_leech_only)
+    
+    #zeylanica-only
+    #form_zey_only <- as.formula(paste(response_var, "~", zey_predictor))
+    #mod_zey_only <- glmmTMB::glmmTMB(formula = form_zey_only, data = filtered_data, family = family(model))
+    #aic_vals$zey_only <- AICc(mod_zey_only)
+    
+    #picta-only
+    #form_picta_only <- as.formula(paste(response_var, "~", picta_predictor))
+    #mod_picta_only <- glmmTMB::glmmTMB(formula = form_picta_only, data = filtered_data, family = family(model))
+    #aic_vals$picta_only <- AICc(mod_picta_only)
+    
+    #lowest AIC
+    lowest_model <- names(which.min(unlist(aic_vals)))
+    aic_entry[[paste0("best_", thresh)]] <- lowest_model
+  }
+  
+  aic_results[[species_name]] <- aic_entry
+}
+
+#convert to table
+aic_table2 <- do.call(rbind, lapply(aic_results, as.data.frame))
+rownames(aic_table2) <- NULL
+
+#rename columns
+colnames(aic_table2) <- c("Species", "lowest_all", "lowest_top50", "lowest_top25")
+aic_table2
+
+#write.csv(aic_table2, file = "mod_comp_table1.csv")
+```
+
+## Summary mammal table
+```{r}
+pruned_aggregated %>%
+  group_by(Species, Family, TrophicLevel, ActivityCycle) %>%
+  summarise(Total_Abundance = sum(Number.of.Animals, na.rm = TRUE), .groups = "drop") %>%
+  mutate(
+    Functional_Groups = paste(
+      case_when(
+        TrophicLevel == 1 ~ "Herbivore",
+        TrophicLevel == 2 ~ "Omnivore",
+        TrophicLevel == 3 ~ "Carnivore",
+        TRUE ~ NA_character_
+      ),
+      case_when(
+        ActivityCycle == 1 ~ "Nocturnal",
+        ActivityCycle == 2 ~ "Crepuscular",
+        ActivityCycle == 3 ~ "Diurnal",
+        TRUE ~ NA_character_
+      ),
+      sep = ", "
+    )
+  ) %>%
+  select(Species, Family, Functional_Groups, Total_Abundance) %>%
+  arrange(desc(Total_Abundance)) %>%
+  #write.csv(file = "MammalObsTable.csv", row.names = FALSE)
+```
+
