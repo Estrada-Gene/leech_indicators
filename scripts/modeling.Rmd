@@ -2725,3 +2725,174 @@ pruned_aggregated %>%
   #write.csv(file = "MammalObsTable.csv", row.names = FALSE)
 ```
 
+## Summary camera trap tables
+```{r}
+deployments <- read.csv("data/ofp_deployments-2021-11-04.csv", stringsAsFactors = FALSE)
+partitions <- read.csv("data/CTlocations_partitions_May2024.csv", stringsAsFactors = FALSE)
+by_day <- read.csv("data/30-daysamplingperiods-byday.csv", stringsAsFactors = FALSE)
+
+#parse dates across df's 
+parse_dates <- function(date_col) {
+  parse_date_time(date_col, orders = c("mdy", "ymd"))
+}
+
+deployments <- deployments %>%
+  mutate(Camera.Deployment.Begin.Date = parse_dates(Camera.Deployment.Begin.Date),
+         Camera.Deployment.End.Date = parse_dates(Camera.Deployment.End.Date))
+
+by_day <- by_day %>%
+  mutate(date = parse_dates(date))
+
+#expand deployments to daily scale 
+deployments_daily <- deployments %>%
+  filter(!is.na(Camera.Deployment.Begin.Date) & !is.na(Camera.Deployment.End.Date)) %>%
+  mutate(date = map2(Camera.Deployment.Begin.Date, Camera.Deployment.End.Date, seq, by = "1 day")) %>%
+  unnest(date) %>%
+  select(locationID = Deployment.Location.ID, date) %>%
+  distinct()
+
+#link daily activity to sampling period and forest type
+deployments_daily <- deployments_daily %>%
+  inner_join(by_day, by = "date") %>%
+  inner_join(partitions, by = "locationID")
+```
+
+Create camera trap by partition table
+```{r}
+#create grid of all combinations (64 periods x 12 partitions)
+all_partitions <- partitions %>% 
+  filter(habitat != "Kerangas") %>%
+  select(habitat, partition) %>% 
+  distinct()
+
+all_periods <- unique(by_day$samplingperiod)
+
+full_grid <- crossing(all_partitions, samplingperiod = all_periods)
+
+#calculate active CT and CT nights per partition per sampling period
+period_summary <- deployments_daily %>%
+  group_by(habitat, partition, samplingperiod) %>%
+  summarise(active_traps = n_distinct(locationID),
+            trap_days = n(),
+            .groups = "drop")
+
+#complete grid to include 0s for inactive periods
+period_summary_complete <- full_grid %>%
+  left_join(period_summary, by = c("habitat", "partition", "samplingperiod")) %>%
+  mutate(active_traps = replace_na(active_traps, 0),
+         trap_days = replace_na(trap_days, 0))
+
+#counts of total camera traps by partition
+total_traps_count <- partitions %>%
+  filter(habitat != "Kerangas") %>%
+  group_by(habitat, partition) %>%
+  summarise(N_camera_traps = n_distinct(locationID), .groups = "drop")
+
+#camera trap nights over study period
+total_days_count <- deployments_daily %>%
+  filter(habitat != "Kerangas") %>%
+  group_by(habitat, partition) %>%
+  summarise(total_ct_days = n(), .groups = "drop")
+
+#calculate mean and SD across sampling periods
+metrics_across_periods <- period_summary_complete %>%
+  group_by(habitat, partition) %>%
+  summarise(mean_active = mean(active_traps),
+            sd_active   = sd(active_traps),
+            mean_days   = mean(trap_days),
+            sd_days     = sd(trap_days),
+            .groups     = "drop")
+
+forest_order <- rev(c("Peat Swamp", "Freshwater Swamp", "Alluvial Bench", 
+                  "Lowland Sandstone", "Lowland Granite", "Upland Granite", "Montane"))
+
+#combine into final table
+summary_table <- total_traps_count %>%
+  left_join(metrics_across_periods, by = c("habitat", "partition")) %>%
+  left_join(total_days_count, by = c("habitat", "partition")) %>%
+  mutate(total_ct_days = replace_na(total_ct_days, 0)) %>%
+  mutate(habitat = factor(habitat, levels = forest_order)) %>%
+  arrange(habitat, partition) %>%
+  transmute(
+    `Forest Type` = habitat,
+    `Forest Type Partition` = partition,
+    `N Camera Traps` = N_camera_traps,
+    `Active camera traps (Mean ± SD)` = paste0(round(mean_active, 2), " (±", round(sd_active, 2), ")"),
+    `N camera Trap Nights` = total_ct_days,
+    `Camera Trap Nights (Mean ± SD)` = paste0(round(mean_days, 2), " (±", round(sd_days, 2), ")")
+  )
+
+#write.csv(summary_table, "partition_summary_table.csv", row.names = FALSE)
+```
+
+check for continual coverage in camera traps by partition
+```{r}
+#shows which partitions during which sampling periods there was no CT surveying
+period_summary_complete %>%
+  filter(active_traps == 0) %>%
+  select(habitat, partition, samplingperiod) %>%
+  arrange(habitat, partition, samplingperiod) %>%
+  print(n = Inf)
+```
+
+Gantt chart of CT deployments
+```{r}
+#prep data
+gantt_data <- deployments %>%
+  rename(locationID = Deployment.Location.ID) %>%
+  inner_join(partitions, by = "locationID") %>%
+  filter(!is.na(Camera.Deployment.Begin.Date) & !is.na(Camera.Deployment.End.Date)) %>%
+  arrange(habitat, partition, Camera.Deployment.Begin.Date) %>%
+  mutate(locationID = factor(locationID, levels = unique(locationID))) %>%
+  filter(habitat != "Kerangas") %>%
+  mutate(habitat = factor(habitat, levels = forest_order)) %>%
+  arrange(habitat, partition, Camera.Deployment.Begin.Date)
+
+#set custom color palette
+forest_colors <- c(
+  "Peat Swamp"        = "#401D00",
+  "Freshwater Swamp"  = "#643E00",
+  "Alluvial Bench"    = "#896007",
+  "Lowland Sandstone" = "#AF8228",
+  "Lowland Granite"   = "#D3A43B",
+  "Upland Granite"    = "#F4C444",
+  "Montane"           = "#FFDD2D")
+
+ordered_colors <- forest_colors[forest_order]
+
+#forcing labels to be horizontal and bold
+num_facets <- length(forest_order)
+horizontal_angles <- rep(0, num_facets)
+bold_faces <- rep("bold", num_facets)
+
+#plot
+gantt <- ggplot(gantt_data) +
+  geom_segment(aes(x = Camera.Deployment.Begin.Date, xend = Camera.Deployment.End.Date, 
+                   y = locationID, yend = locationID, color = habitat), 
+               size = 1.2, alpha = 0.8) +
+  facet_grid2(habitat ~ ., scales = "free_y", space = "free_y",
+              strip = strip_themed(
+                text_y = elem_list_text(
+                  color = ordered_colors,    
+                  angle = horizontal_angles, 
+                  face = bold_faces,         
+                  size = 9))) +
+  scale_x_date(date_breaks = "6 months", date_labels = "%b %Y") +
+  scale_color_manual(values = forest_colors) +
+  theme_minimal() +
+  labs(x = "", y = "camera trap location ID") +
+  theme(axis.text.y = element_text(size = 4), 
+        axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+        strip.background = element_blank(),
+        panel.grid.major.y = element_blank(),
+        panel.grid.minor.x = element_blank(),
+        legend.position = "none")
+
+#export 
+#jpeg(filename = "gantt_chart.jpg",
+ #    width = 6.5, height = 11.0,
+  #   units = "in", res = 450, quality = 100)
+
+#print(gantt)
+#dev.off()
+```
