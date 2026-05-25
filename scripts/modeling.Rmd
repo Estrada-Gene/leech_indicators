@@ -2837,6 +2837,8 @@ period_summary_complete %>%
 
 Gantt chart of CT deployments
 ```{r}
+library(ggh4x)
+
 #prep data
 gantt_data <- deployments %>%
   rename(locationID = Deployment.Location.ID) %>%
@@ -2889,10 +2891,10 @@ gantt <- ggplot(gantt_data) +
         legend.position = "none")
 
 #export 
-#jpeg(filename = "gantt_chart.jpg",
- #    width = 6.5, height = 11.0,
-  #   units = "in", res = 450, quality = 100)
+jpeg(filename = "gantt_chart.jpg",
+     width = 6.5, height = 11.0,
+     units = "in", res = 450, quality = 100)
 
-#print(gantt)
-#dev.off()
+print(gantt)
+dev.off()
 ```
